@@ -100,6 +100,7 @@ internal static class SelfTest
         CheckAuto(failures, "ьн", "my");
         CheckAuto(failures, "рш", "hi");
         CheckCustomAuto(failures);
+        CheckExactAutoReplacement(failures);
         CheckTextConversion(failures, "ghbdtn vbh", "привет мир");
         CheckTextConversion(failures, "руддщ цщкдв", "hello world");
         CheckManual(failures, "vtyz", "меня");
@@ -140,6 +141,28 @@ internal static class SelfTest
         }
     }
 
+    private static void CheckExactAutoReplacement(List<string> failures)
+    {
+        var settings = new AppSettings
+        {
+            CustomAutoReplacements =
+            [
+                new AutoReplacementRule { Original = "test", Corrected = "тест" },
+                new AutoReplacementRule { Original = "зкщпкфь", Corrected = "program" },
+            ],
+        };
+
+        if (!TextHeuristics.TryAutoCorrect("test", settings, out var latinCorrection) || latinCorrection.Text != "тест")
+        {
+            failures.Add($"EXACT test: expected тест, actual {latinCorrection?.Text ?? "<none>"}");
+        }
+
+        if (!TextHeuristics.TryAutoCorrect("зкщпкфь", settings, out var cyrillicCorrection) || cyrillicCorrection.Text != "program")
+        {
+            failures.Add($"EXACT зкщпкфь: expected program, actual {cyrillicCorrection?.Text ?? "<none>"}");
+        }
+    }
+
     private static void CheckTextConversion(List<string> failures, string input, string expected)
     {
         if (!TextHeuristics.TryConvertText(input, out var correction) || correction.Text != expected)
@@ -175,6 +198,8 @@ internal static class SelfTest
                 FirstRunHintShown = true,
                 CustomEnglishWords = ["codex"],
                 CustomRussianWords = ["пример"],
+                LearnFromManualCorrections = true,
+                CustomAutoReplacements = [new AutoReplacementRule { Original = "ghbdtn", Corrected = "привет" }],
                 ConvertWordHotkey = new HotkeyBinding { Ctrl = true, Alt = false, Key = Keys.F8 },
             };
 
@@ -188,6 +213,11 @@ internal static class SelfTest
             if (!loaded.CustomEnglishWords.Contains("codex") || !loaded.CustomRussianWords.Contains("пример"))
             {
                 failures.Add("SETTINGS roundtrip: custom dictionaries were not preserved");
+            }
+
+            if (!loaded.LearnFromManualCorrections || loaded.CustomAutoReplacements.Count != 1 || loaded.CustomAutoReplacements[0].Corrected != "привет")
+            {
+                failures.Add("SETTINGS roundtrip: auto replacement rules were not preserved");
             }
 
             if (loaded.ConvertWordHotkey.Key != Keys.F8 || !loaded.ConvertWordHotkey.Ctrl || loaded.ConvertWordHotkey.Alt)
@@ -672,6 +702,7 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
             _lastCorrection = null;
             _lastTypedSegment = null;
             AddHistory("Ручная", word, correction.Text);
+            MaybeLearnAutoReplacement(word, correction.Text);
             PlaySwitchSound(correction.Direction);
             UpdateBalloon("Ручная конвертация", $"{word} -> {correction.Text}");
             return;
@@ -701,6 +732,7 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         _lastCorrection = null;
         _lastTypedSegment = null;
         AddHistory("Ручная", segment.Word + segment.Delimiter, segmentCorrection.Text + segment.Delimiter);
+        MaybeLearnAutoReplacement(segment.Word, segmentCorrection.Text);
         PlaySwitchSound(segmentCorrection.Direction);
         UpdateBalloon("Ручная конвертация", $"{segment.Word} -> {segmentCorrection.Text}");
     }
@@ -1068,6 +1100,19 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         _settingsForm?.RefreshHistory();
     }
 
+    private void MaybeLearnAutoReplacement(string original, string corrected)
+    {
+        if (!_settings.LearnFromManualCorrections
+            || !TextHeuristics.CanLearnAutoReplacement(original, corrected)
+            || !AutoReplacementRule.AddOrUpdate(_settings.CustomAutoReplacements, original, corrected, learned: true))
+        {
+            return;
+        }
+
+        SettingsStore.Save(_settings);
+        _settingsForm?.RefreshReplacementRules();
+    }
+
     private bool IsForegroundProcessExcluded(out string processName)
     {
         processName = NativeMethods.GetForegroundProcessName();
@@ -1092,6 +1137,7 @@ internal sealed class SettingsForm : Form
     private readonly CheckBox _paused = new();
     private readonly CheckBox _startup = new();
     private readonly CheckBox _autoCheckUpdates = new();
+    private readonly CheckBox _learnFromManualCorrections = new();
     private readonly ComboBox _enToRuSound = new();
     private readonly ComboBox _ruToEnSound = new();
     private readonly Label _hotkeysLabel = new();
@@ -1102,6 +1148,7 @@ internal sealed class SettingsForm : Form
     private readonly TextBox _excludedProcesses = new();
     private readonly TextBox _russianWords = new();
     private readonly TextBox _englishWords = new();
+    private readonly TextBox _autoReplacements = new();
     private readonly ListBox _history = new();
     private readonly Label _installStatus = new();
     private readonly Label _updateStatus = new();
@@ -1111,6 +1158,8 @@ internal sealed class SettingsForm : Form
     private readonly Button _installUpdateButton = new();
     private readonly Button _saveHotkeysButton = new();
     private readonly Button _resetHotkeysButton = new();
+    private readonly Button _saveReplacementsButton = new();
+    private readonly Button _clearLearnedReplacementsButton = new();
     private readonly Button _exportSettingsButton = new();
     private readonly Button _importSettingsButton = new();
     private readonly Button _showFirstRunHintButton = new();
@@ -1159,6 +1208,7 @@ internal sealed class SettingsForm : Form
         };
         tabs.TabPages.Add(CreateGeneralTab());
         tabs.TabPages.Add(CreateListsTab());
+        tabs.TabPages.Add(CreateReplacementsTab());
         tabs.TabPages.Add(CreateSettingsTab());
         tabs.TabPages.Add(CreateHistoryTab());
         tabs.TabPages.Add(CreateInstallTab());
@@ -1191,6 +1241,7 @@ internal sealed class SettingsForm : Form
         _paused.Checked = _context.Settings.Paused;
         _startup.Checked = StartupManager.IsEnabledForPath(InstallManager.PreferredStartupPath);
         _autoCheckUpdates.Checked = _context.Settings.AutoCheckUpdates;
+        _learnFromManualCorrections.Checked = _context.Settings.LearnFromManualCorrections;
         SetComboValue(_enToRuSound, _context.Settings.EnToRuSound);
         SetComboValue(_ruToEnSound, _context.Settings.RuToEnSound);
         _convertWordHotkey.SetBinding(_context.Settings.ConvertWordHotkey);
@@ -1200,12 +1251,32 @@ internal sealed class SettingsForm : Form
         _excludedProcesses.Text = LinesFrom(_context.Settings.ExcludedProcesses);
         _russianWords.Text = LinesFrom(_context.Settings.CustomRussianWords);
         _englishWords.Text = LinesFrom(_context.Settings.CustomEnglishWords);
+        _autoReplacements.Text = ReplacementLinesFrom(_context.Settings.CustomAutoReplacements);
         _updating = false;
 
         UpdateStatus();
         UpdateHotkeysLabel();
         RefreshHistory();
         RefreshInstallState();
+    }
+
+    public void RefreshReplacementRules()
+    {
+        if (IsDisposed)
+        {
+            return;
+        }
+
+        if (InvokeRequired)
+        {
+            BeginInvoke(RefreshReplacementRules);
+            return;
+        }
+
+        if (!_autoReplacements.Focused)
+        {
+            _autoReplacements.Text = ReplacementLinesFrom(_context.Settings.CustomAutoReplacements);
+        }
     }
 
     public void RefreshHistory()
@@ -1451,6 +1522,57 @@ internal sealed class SettingsForm : Form
         return page;
     }
 
+    private TabPage CreateReplacementsTab()
+    {
+        var page = new TabPage("Замены");
+        var layout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            Padding = new Padding(14),
+            RowCount = 5,
+            ColumnCount = 1,
+        };
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 54));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 50));
+        page.Controls.Add(layout);
+
+        ConfigureCheckBox(_learnFromManualCorrections, "Учиться на ручной конвертации слов");
+        layout.Controls.Add(_learnFromManualCorrections, 0, 0);
+
+        layout.Controls.Add(new Label
+        {
+            Text = "Точечные автозамены применяются до эвристики и словаря. Формат: исходное -> исправленное, например ghbdtn -> привет.",
+            Dock = DockStyle.Fill,
+            ForeColor = Color.FromArgb(71, 85, 105),
+        }, 0, 1);
+
+        ConfigureTextArea(_autoReplacements);
+        layout.Controls.Add(_autoReplacements, 0, 2);
+
+        var buttons = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.LeftToRight,
+        };
+        ConfigureButton(_saveReplacementsButton, "Сохранить замены", 200);
+        ConfigureButton(_clearLearnedReplacementsButton, "Очистить выученные", 220);
+        buttons.Controls.Add(_saveReplacementsButton);
+        buttons.Controls.Add(_clearLearnedReplacementsButton);
+        layout.Controls.Add(buttons, 0, 3);
+
+        layout.Controls.Add(new Label
+        {
+            Text = "Обучение добавляет только ручные исправления одиночных слов в разных раскладках. Выделенный текст не добавляется в правила.",
+            Dock = DockStyle.Fill,
+            ForeColor = Color.FromArgb(71, 85, 105),
+        }, 0, 4);
+
+        return page;
+    }
+
     private TabPage CreateHistoryTab()
     {
         var page = new TabPage("История");
@@ -1602,6 +1724,13 @@ internal sealed class SettingsForm : Form
                 _context.UpdateSettings(s => s.AutoCheckUpdates = _autoCheckUpdates.Checked);
             }
         };
+        _learnFromManualCorrections.CheckedChanged += (_, _) =>
+        {
+            if (!_updating)
+            {
+                _context.UpdateSettings(s => s.LearnFromManualCorrections = _learnFromManualCorrections.Checked);
+            }
+        };
         _enToRuSound.SelectedIndexChanged += (_, _) =>
         {
             if (!_updating && _enToRuSound.SelectedItem is string value)
@@ -1639,6 +1768,8 @@ internal sealed class SettingsForm : Form
         };
         _saveHotkeysButton.Click += (_, _) => SaveHotkeys();
         _resetHotkeysButton.Click += (_, _) => ResetHotkeys();
+        _saveReplacementsButton.Click += (_, _) => SaveReplacements();
+        _clearLearnedReplacementsButton.Click += (_, _) => ClearLearnedReplacements();
         _exportSettingsButton.Click += (_, _) => ExportSettings();
         _importSettingsButton.Click += (_, _) => ImportSettings();
         _showFirstRunHintButton.Click += (_, _) => _context.ShowFirstRunHint(force: true);
@@ -1712,6 +1843,49 @@ internal sealed class SettingsForm : Form
             s.UndoHotkey = AppSettings.DefaultUndoHotkey();
             s.PauseHotkey = AppSettings.DefaultPauseHotkey();
         });
+    }
+
+    private void SaveReplacements()
+    {
+        var replacements = ParseReplacementRules(_autoReplacements.Text, out var errors);
+        if (errors.Count > 0)
+        {
+            MessageBox.Show(
+                this,
+                "Не удалось сохранить замены:\r\n" + string.Join("\r\n", errors.Take(8)),
+                "Switcher",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return;
+        }
+
+        _context.UpdateSettings(s => s.CustomAutoReplacements = replacements);
+        MessageBox.Show(this, "Точечные замены сохранены.", "Switcher", MessageBoxButtons.OK, MessageBoxIcon.Information);
+    }
+
+    private void ClearLearnedReplacements()
+    {
+        var learnedCount = _context.Settings.CustomAutoReplacements.Count(rule => rule.Learned);
+        if (learnedCount == 0)
+        {
+            MessageBox.Show(this, "Выученных замен пока нет.", "Switcher", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var result = MessageBox.Show(
+            this,
+            $"Удалить выученные замены: {learnedCount}?",
+            "Switcher",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Question);
+        if (result != DialogResult.Yes)
+        {
+            return;
+        }
+
+        _context.UpdateSettings(s => s.CustomAutoReplacements = s.CustomAutoReplacements
+            .Where(rule => !rule.Learned)
+            .ToList());
     }
 
     private void ExportSettings()
@@ -1902,6 +2076,75 @@ internal sealed class SettingsForm : Form
     private static string LinesFrom(IEnumerable<string> values)
     {
         return string.Join(Environment.NewLine, values);
+    }
+
+    private static List<AutoReplacementRule> ParseReplacementRules(string text, out List<string> errors)
+    {
+        errors = [];
+        var rules = new List<AutoReplacementRule>();
+        var lineNumber = 0;
+        foreach (var rawLine in text.Split(["\r\n", "\n"], StringSplitOptions.None))
+        {
+            lineNumber++;
+            var line = rawLine.Trim();
+            if (line.Length == 0 || line.StartsWith('#'))
+            {
+                continue;
+            }
+
+            if (!TrySplitReplacementRule(line, out var original, out var corrected))
+            {
+                errors.Add($"Строка {lineNumber}: нужен формат исходное -> исправленное.");
+                continue;
+            }
+
+            if (!AutoReplacementRule.IsValidText(original) || !AutoReplacementRule.IsValidText(corrected))
+            {
+                errors.Add($"Строка {lineNumber}: слова должны быть без пробелов и не длиннее 64 символов.");
+                continue;
+            }
+
+            if (string.Equals(original, corrected, StringComparison.OrdinalIgnoreCase))
+            {
+                errors.Add($"Строка {lineNumber}: исходное и исправленное слово совпадают.");
+                continue;
+            }
+
+            rules.Add(new AutoReplacementRule
+            {
+                Original = original,
+                Corrected = corrected,
+                Learned = false,
+                CreatedAt = DateTime.Now,
+            });
+        }
+
+        return AutoReplacementRule.Normalize(rules);
+    }
+
+    private static bool TrySplitReplacementRule(string line, out string original, out string corrected)
+    {
+        foreach (var separator in new[] { "->", "=>", "\t", ";" })
+        {
+            var index = line.IndexOf(separator, StringComparison.Ordinal);
+            if (index <= 0)
+            {
+                continue;
+            }
+
+            original = line[..index].Trim();
+            corrected = line[(index + separator.Length)..].Trim();
+            return original.Length > 0 && corrected.Length > 0;
+        }
+
+        original = "";
+        corrected = "";
+        return false;
+    }
+
+    private static string ReplacementLinesFrom(IEnumerable<AutoReplacementRule> rules)
+    {
+        return string.Join(Environment.NewLine, rules.Select(rule => $"{rule.Original} -> {rule.Corrected}"));
     }
 }
 
@@ -2163,6 +2406,7 @@ internal sealed record AppSettings
     public bool Sound { get; set; } = true;
     public bool StartWithWindows { get; set; }
     public bool AutoCheckUpdates { get; set; } = true;
+    public bool LearnFromManualCorrections { get; set; } = true;
     public bool FirstRunHintShown { get; set; }
     public DateTime? LastUpdateCheckUtc { get; set; }
     public string EnToRuSound { get; set; } = SoundPlayerNames.Asterisk;
@@ -2187,7 +2431,81 @@ internal sealed record AppSettings
 
     public List<string> CustomRussianWords { get; set; } = [];
     public List<string> CustomEnglishWords { get; set; } = [];
+    public List<AutoReplacementRule> CustomAutoReplacements { get; set; } = [];
     public List<CorrectionHistoryItem> History { get; set; } = [];
+}
+
+internal sealed record AutoReplacementRule
+{
+    public string Original { get; set; } = "";
+    public string Corrected { get; set; } = "";
+    public bool Learned { get; set; }
+    public DateTime CreatedAt { get; set; } = DateTime.Now;
+
+    public static bool IsValidText(string text)
+    {
+        return text.Length is > 0 and <= 64 && !text.Any(char.IsWhiteSpace);
+    }
+
+    public static List<AutoReplacementRule> Normalize(IEnumerable<AutoReplacementRule> rules)
+    {
+        var normalized = new Dictionary<string, AutoReplacementRule>(StringComparer.OrdinalIgnoreCase);
+        foreach (var rule in rules)
+        {
+            var original = rule.Original.Trim();
+            var corrected = rule.Corrected.Trim();
+            if (!IsValidText(original)
+                || !IsValidText(corrected)
+                || string.Equals(original, corrected, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            normalized[original] = new AutoReplacementRule
+            {
+                Original = original,
+                Corrected = corrected,
+                Learned = rule.Learned,
+                CreatedAt = rule.CreatedAt == default ? DateTime.Now : rule.CreatedAt,
+            };
+        }
+
+        return normalized.Values.ToList();
+    }
+
+    public static bool AddOrUpdate(List<AutoReplacementRule> rules, string original, string corrected, bool learned)
+    {
+        original = original.Trim();
+        corrected = corrected.Trim();
+        if (!IsValidText(original) || !IsValidText(corrected))
+        {
+            return false;
+        }
+
+        var existing = rules.FirstOrDefault(rule => string.Equals(rule.Original, original, StringComparison.OrdinalIgnoreCase));
+        if (existing is not null)
+        {
+            if (string.Equals(existing.Corrected, corrected, StringComparison.Ordinal)
+                && existing.Learned == learned)
+            {
+                return false;
+            }
+
+            existing.Original = original;
+            existing.Corrected = corrected;
+            existing.Learned = existing.Learned && learned;
+            return true;
+        }
+
+        rules.Insert(0, new AutoReplacementRule
+        {
+            Original = original,
+            Corrected = corrected,
+            Learned = learned,
+            CreatedAt = DateTime.Now,
+        });
+        return true;
+    }
 }
 
 internal sealed record CorrectionHistoryItem
@@ -2323,10 +2641,12 @@ internal static class SettingsStore
         settings.ExcludedProcesses ??= [];
         settings.CustomRussianWords ??= [];
         settings.CustomEnglishWords ??= [];
+        settings.CustomAutoReplacements ??= [];
         settings.History ??= [];
         settings.ExcludedProcesses = NormalizeList(settings.ExcludedProcesses);
         settings.CustomRussianWords = NormalizeList(settings.CustomRussianWords);
         settings.CustomEnglishWords = NormalizeList(settings.CustomEnglishWords);
+        settings.CustomAutoReplacements = AutoReplacementRule.Normalize(settings.CustomAutoReplacements);
         settings.History = settings.History
             .Where(item => !string.IsNullOrWhiteSpace(item.Original) || !string.IsNullOrWhiteSpace(item.Corrected))
             .Take(30)
@@ -2871,6 +3191,11 @@ internal static class TextHeuristics
     public static bool TryAutoCorrect(string word, AppSettings settings, out CorrectionResult correction)
     {
         correction = default!;
+        if (TryCustomAutoReplacement(word, settings, out correction))
+        {
+            return true;
+        }
+
         if (word.Length < 2 || !TryConvertAny(word, out var converted))
         {
             return false;
@@ -2909,6 +3234,68 @@ internal static class TextHeuristics
         if (targetScore >= 22 && targetScore - sourceScore >= 14)
         {
             correction = converted;
+            return true;
+        }
+
+        return false;
+    }
+
+    public static bool CanLearnAutoReplacement(string original, string corrected)
+    {
+        if (!TryCreateAutoReplacementCorrection(original, corrected, out _)
+            || !TryConvertAny(original, out var converted))
+        {
+            return false;
+        }
+
+        return string.Equals(converted.Text, corrected, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool TryCustomAutoReplacement(string word, AppSettings settings, out CorrectionResult correction)
+    {
+        correction = default!;
+        foreach (var rule in settings.CustomAutoReplacements)
+        {
+            if (string.Equals(rule.Original, word, StringComparison.OrdinalIgnoreCase)
+                && TryCreateAutoReplacementCorrection(word, rule.Corrected, out correction))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool TryCreateAutoReplacementCorrection(string original, string corrected, out CorrectionResult correction)
+    {
+        correction = default!;
+        original = original.Trim();
+        corrected = corrected.Trim();
+        if (!CanConvert(original)
+            || corrected.Length == 0
+            || corrected.Any(char.IsWhiteSpace)
+            || string.Equals(original, corrected, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (original.All(IsLatin) && corrected.All(IsCyrillic))
+        {
+            correction = new CorrectionResult(
+                corrected,
+                LayoutDirection.LatinToCyrillic,
+                KeyboardLayout.English,
+                KeyboardLayout.Russian);
+            return true;
+        }
+
+        if (original.All(IsCyrillic) && corrected.All(IsLatin))
+        {
+            correction = new CorrectionResult(
+                corrected,
+                LayoutDirection.CyrillicToLatin,
+                KeyboardLayout.Russian,
+                KeyboardLayout.English);
             return true;
         }
 
