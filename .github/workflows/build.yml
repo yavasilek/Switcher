@@ -1,0 +1,53 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+
+jobs:
+  build:
+    name: Build Windows x64
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build -c Release --no-restore
+
+      - name: Publish single-file exe
+        run: >
+          dotnet publish -c Release -r win-x64 -o .\publish\win-x64
+          -p:PublishSingleFile=true
+          -p:SelfContained=true
+          -p:EnableCompressionInSingleFile=true
+          -p:DebugType=None
+          -p:DebugSymbols=false
+
+      - name: Self-test
+        shell: pwsh
+        run: |
+          $exe = Join-Path $PWD 'publish\win-x64\Switcher.exe'
+          $p = Start-Process -FilePath $exe -ArgumentList '--self-test' -Wait -PassThru -WindowStyle Hidden
+          if ($p.ExitCode -ne 0) {
+            exit $p.ExitCode
+          }
+
+      - name: Upload executable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Switcher-win-x64
+          path: publish/win-x64/Switcher.exe
+          if-no-files-found: error

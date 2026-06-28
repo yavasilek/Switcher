@@ -1,5 +1,11 @@
 # Switcher
 
+Windows tray utility for automatic RU/EN keyboard layout correction.
+
+Switcher watches the last typed word, detects common wrong-layout input such as
+`ghbdtn -> привет`, switches the active keyboard layout, replaces the typed text,
+and plays a system sound. It also supports manual conversion and undo hotkeys.
+
 Tray-приложение для Windows, которое автоматически исправляет слова, набранные в неверной RU/EN раскладке, переключает раскладку и проигрывает системный звук.
 
 ## Управление
@@ -20,6 +26,20 @@ dotnet publish -c Release -r win-x64 -o .\publish\win-x64 -p:PublishSingleFile=t
 
 ```text
 publish\win-x64\Switcher.exe
+```
+
+## GitHub Releases
+
+The repository includes GitHub Actions:
+
+- `.github/workflows/build.yml` builds and uploads `Switcher.exe` as an artifact on pushes and pull requests.
+- `.github/workflows/release.yml` builds a single-file Windows x64 exe and attaches it to a GitHub Release when a tag like `v0.1.0` is pushed.
+
+Release locally:
+
+```powershell
+git tag v0.1.0
+git push origin main --tags
 ```
 
 ## Проверка
