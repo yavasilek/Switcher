@@ -5,6 +5,7 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using Microsoft.Win32;
 
 namespace Switcher;
@@ -105,6 +106,7 @@ internal static class SelfTest
         CheckManual(failures, "сщву", "code");
         CheckNoAuto(failures, "test");
         CheckNoAuto(failures, "code");
+        CheckSettingsRoundTrip(failures);
         CheckInputSize(failures);
 
         if (failures.Count == 0)
@@ -162,6 +164,54 @@ internal static class SelfTest
         }
     }
 
+    private static void CheckSettingsRoundTrip(List<string> failures)
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"Switcher.settings.{Guid.NewGuid():N}.json");
+        try
+        {
+            var settings = new AppSettings
+            {
+                AutoSwitch = false,
+                FirstRunHintShown = true,
+                CustomEnglishWords = ["codex"],
+                CustomRussianWords = ["пример"],
+                ConvertWordHotkey = new HotkeyBinding { Ctrl = true, Alt = false, Key = Keys.F8 },
+            };
+
+            SettingsStore.SaveToFile(settings, path);
+            var loaded = SettingsStore.LoadFromFile(path);
+            if (loaded.AutoSwitch || !loaded.FirstRunHintShown)
+            {
+                failures.Add("SETTINGS roundtrip: boolean settings were not preserved");
+            }
+
+            if (!loaded.CustomEnglishWords.Contains("codex") || !loaded.CustomRussianWords.Contains("пример"))
+            {
+                failures.Add("SETTINGS roundtrip: custom dictionaries were not preserved");
+            }
+
+            if (loaded.ConvertWordHotkey.Key != Keys.F8 || !loaded.ConvertWordHotkey.Ctrl || loaded.ConvertWordHotkey.Alt)
+            {
+                failures.Add($"SETTINGS roundtrip: hotkey was not preserved, actual {loaded.ConvertWordHotkey}");
+            }
+        }
+        catch (Exception ex)
+        {
+            failures.Add($"SETTINGS roundtrip: {ex.GetType().Name}: {ex.Message}");
+        }
+        finally
+        {
+            try
+            {
+                File.Delete(path);
+            }
+            catch
+            {
+                // Best effort cleanup for self-test temp file.
+            }
+        }
+    }
+
     private static void CheckInputSize(List<string> failures)
     {
         var actual = Marshal.SizeOf<NativeMethods.Input>();
@@ -205,6 +255,10 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
 
         _keyboardHook = new KeyboardHook(HandleKeyDown);
         _ = CheckForUpdatesInBackgroundAsync();
+        if (!_settings.FirstRunHintShown)
+        {
+            _ = ShowFirstRunHintLaterAsync();
+        }
     }
 
     public AppSettings Settings => _settings;
@@ -257,6 +311,27 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         SettingsStore.Save(_settings);
         RefreshMenu();
         _settingsForm?.RefreshFromSettings();
+    }
+
+    public void ReplaceSettings(AppSettings settings)
+    {
+        _settings = settings;
+        StartupManager.SetEnabled(_settings.StartWithWindows, InstallManager.PreferredStartupPath);
+        _settings.StartWithWindows = StartupManager.IsEnabledForPath(InstallManager.PreferredStartupPath);
+        SettingsStore.Save(_settings);
+        ResetTypingState();
+        RefreshMenu();
+        _settingsForm?.RefreshFromSettings();
+    }
+
+    public void ExportSettings(string filePath)
+    {
+        SettingsStore.SaveToFile(_settings, filePath);
+    }
+
+    public void ImportSettings(string filePath)
+    {
+        ReplaceSettings(SettingsStore.LoadFromFile(filePath));
     }
 
     protected override void ExitThreadCore()
@@ -322,14 +397,26 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         {
             Name = "CheckUpdates",
         };
-        var convertItem = new ToolStripMenuItem("Конвертировать последнее слово: Ctrl+Alt+Space");
-        convertItem.Enabled = false;
-        var convertSelectionItem = new ToolStripMenuItem("Конвертировать выделенный текст: Ctrl+Alt+Enter");
-        convertSelectionItem.Enabled = false;
-        var undoItem = new ToolStripMenuItem("Откатить автоисправление: Ctrl+Alt+Backspace");
-        undoItem.Enabled = false;
-        var pauseHotkeyItem = new ToolStripMenuItem("Пауза: Ctrl+Alt+P");
-        pauseHotkeyItem.Enabled = false;
+        var convertItem = new ToolStripMenuItem
+        {
+            Name = "ConvertWordHotkey",
+            Enabled = false,
+        };
+        var convertSelectionItem = new ToolStripMenuItem
+        {
+            Name = "ConvertSelectionHotkey",
+            Enabled = false,
+        };
+        var undoItem = new ToolStripMenuItem
+        {
+            Name = "UndoHotkey",
+            Enabled = false,
+        };
+        var pauseHotkeyItem = new ToolStripMenuItem
+        {
+            Name = "PauseHotkey",
+            Enabled = false,
+        };
         var exitItem = new ToolStripMenuItem("Выход", null, (_, _) => ExitThread());
 
         menu.Items.AddRange([
@@ -402,6 +489,26 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
                 ? $"Установить обновление {_availableUpdate.TagName}"
                 : "Проверить обновления";
         }
+
+        if (menu.Items["ConvertWordHotkey"] is ToolStripMenuItem convertWordItem)
+        {
+            convertWordItem.Text = $"Конвертировать последнее слово: {_settings.ConvertWordHotkey}";
+        }
+
+        if (menu.Items["ConvertSelectionHotkey"] is ToolStripMenuItem convertSelectionItem)
+        {
+            convertSelectionItem.Text = $"Конвертировать выделенный текст: {_settings.ConvertSelectionHotkey}";
+        }
+
+        if (menu.Items["UndoHotkey"] is ToolStripMenuItem undoItem)
+        {
+            undoItem.Text = $"Откатить автоисправление: {_settings.UndoHotkey}";
+        }
+
+        if (menu.Items["PauseHotkey"] is ToolStripMenuItem pauseHotkeyItem)
+        {
+            pauseHotkeyItem.Text = $"Пауза: {_settings.PauseHotkey}";
+        }
     }
 
     private void ShowSettings()
@@ -419,7 +526,7 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
 
     private bool HandleKeyDown(Keys key, int scanCode)
     {
-        if (KeyboardState.IsCtrlAltDown() && key == Keys.P)
+        if (KeyboardState.Matches(_settings.PauseHotkey, key))
         {
             PostToUi(TogglePause);
             return true;
@@ -431,19 +538,19 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
             return false;
         }
 
-        if (KeyboardState.IsCtrlAltDown() && key == Keys.Back)
+        if (KeyboardState.Matches(_settings.UndoHotkey, key))
         {
             PostToUi(UndoLastCorrection);
             return true;
         }
 
-        if (KeyboardState.IsCtrlAltDown() && key == Keys.Space)
+        if (KeyboardState.Matches(_settings.ConvertWordHotkey, key))
         {
             PostToUi(ConvertRecentWordManually);
             return true;
         }
 
-        if (KeyboardState.IsCtrlAltDown() && key == Keys.Enter)
+        if (KeyboardState.Matches(_settings.ConvertSelectionHotkey, key))
         {
             PostToUi(ConvertSelectedTextManually);
             return true;
@@ -674,6 +781,33 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         UpdateBalloon("Пауза", _settings.Paused ? "включена" : "выключена");
     }
 
+    public void ShowFirstRunHint(bool force)
+    {
+        if (!force && _settings.FirstRunHintShown)
+        {
+            return;
+        }
+
+        _settings.FirstRunHintShown = true;
+        SettingsStore.Save(_settings);
+
+        var result = MessageBox.Show(
+            $"Switcher работает в трее и исправляет слова после пробела или знака.\r\n\r\n" +
+            $"{_settings.ConvertWordHotkey} - конвертировать текущее или последнее слово.\r\n" +
+            $"{_settings.ConvertSelectionHotkey} - конвертировать выделенный текст.\r\n" +
+            $"{_settings.UndoHotkey} - откатить последнюю автозамену.\r\n" +
+            $"{_settings.PauseHotkey} - включить или выключить паузу.\r\n\r\n" +
+            "Открыть настройки сейчас?",
+            "Первый запуск Switcher",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Information);
+
+        if (result == DialogResult.Yes)
+        {
+            ShowSettings();
+        }
+    }
+
     public void InstallToSystem()
     {
         try
@@ -842,6 +976,19 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         }
     }
 
+    private async Task ShowFirstRunHintLaterAsync()
+    {
+        try
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(900));
+            PostToUi(() => ShowFirstRunHint(force: false));
+        }
+        catch
+        {
+            // First-run help is optional and must never block startup.
+        }
+    }
+
     private void StoreUpdateCheckResult(UpdateInfo update)
     {
         _availableUpdate = update.IsNewer ? update : null;
@@ -947,6 +1094,11 @@ internal sealed class SettingsForm : Form
     private readonly CheckBox _autoCheckUpdates = new();
     private readonly ComboBox _enToRuSound = new();
     private readonly ComboBox _ruToEnSound = new();
+    private readonly Label _hotkeysLabel = new();
+    private readonly HotkeyRow _convertWordHotkey = new("Текущее или последнее слово");
+    private readonly HotkeyRow _convertSelectionHotkey = new("Выделенный текст");
+    private readonly HotkeyRow _undoHotkey = new("Откат автозамены");
+    private readonly HotkeyRow _pauseHotkey = new("Пауза");
     private readonly TextBox _excludedProcesses = new();
     private readonly TextBox _russianWords = new();
     private readonly TextBox _englishWords = new();
@@ -957,6 +1109,11 @@ internal sealed class SettingsForm : Form
     private readonly Button _uninstallButton = new();
     private readonly Button _checkUpdateButton = new();
     private readonly Button _installUpdateButton = new();
+    private readonly Button _saveHotkeysButton = new();
+    private readonly Button _resetHotkeysButton = new();
+    private readonly Button _exportSettingsButton = new();
+    private readonly Button _importSettingsButton = new();
+    private readonly Button _showFirstRunHintButton = new();
     private UpdateInfo? _latestUpdate;
     private bool _updating;
 
@@ -1002,6 +1159,7 @@ internal sealed class SettingsForm : Form
         };
         tabs.TabPages.Add(CreateGeneralTab());
         tabs.TabPages.Add(CreateListsTab());
+        tabs.TabPages.Add(CreateSettingsTab());
         tabs.TabPages.Add(CreateHistoryTab());
         tabs.TabPages.Add(CreateInstallTab());
         root.Controls.Add(tabs, 0, 2);
@@ -1035,12 +1193,17 @@ internal sealed class SettingsForm : Form
         _autoCheckUpdates.Checked = _context.Settings.AutoCheckUpdates;
         SetComboValue(_enToRuSound, _context.Settings.EnToRuSound);
         SetComboValue(_ruToEnSound, _context.Settings.RuToEnSound);
+        _convertWordHotkey.SetBinding(_context.Settings.ConvertWordHotkey);
+        _convertSelectionHotkey.SetBinding(_context.Settings.ConvertSelectionHotkey);
+        _undoHotkey.SetBinding(_context.Settings.UndoHotkey);
+        _pauseHotkey.SetBinding(_context.Settings.PauseHotkey);
         _excludedProcesses.Text = LinesFrom(_context.Settings.ExcludedProcesses);
         _russianWords.Text = LinesFrom(_context.Settings.CustomRussianWords);
         _englishWords.Text = LinesFrom(_context.Settings.CustomEnglishWords);
         _updating = false;
 
         UpdateStatus();
+        UpdateHotkeysLabel();
         RefreshHistory();
         RefreshInstallState();
     }
@@ -1116,13 +1279,9 @@ internal sealed class SettingsForm : Form
         layout.Controls.Add(_paused, 0, 2);
         layout.Controls.Add(_startup, 0, 3);
 
-        var hotkeys = new Label
-        {
-            Text = "Ctrl+Alt+Space - конвертировать текущее/последнее слово\r\nCtrl+Alt+Enter - конвертировать выделенный текст\r\nCtrl+Alt+Backspace - откатить последнее автоисправление\r\nCtrl+Alt+P - включить или выключить паузу",
-            Dock = DockStyle.Fill,
-            ForeColor = Color.FromArgb(51, 65, 85),
-        };
-        layout.Controls.Add(hotkeys, 0, 5);
+        _hotkeysLabel.Dock = DockStyle.Fill;
+        _hotkeysLabel.ForeColor = Color.FromArgb(51, 65, 85);
+        layout.Controls.Add(_hotkeysLabel, 0, 5);
 
         var soundGrid = new TableLayoutPanel
         {
@@ -1142,6 +1301,103 @@ internal sealed class SettingsForm : Form
         _lastActionLabel.Dock = DockStyle.Fill;
         _lastActionLabel.ForeColor = Color.FromArgb(71, 85, 105);
         layout.Controls.Add(_lastActionLabel, 0, 8);
+
+        return page;
+    }
+
+    private TabPage CreateSettingsTab()
+    {
+        var page = new TabPage("Настройки");
+        var layout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            Padding = new Padding(14),
+            RowCount = 8,
+            ColumnCount = 1,
+        };
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 210));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 22));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 92));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        page.Controls.Add(layout);
+
+        layout.Controls.Add(new Label
+        {
+            Text = "Горячие клавиши",
+            Dock = DockStyle.Fill,
+            Font = new Font("Segoe UI Semibold", 10F),
+            ForeColor = Color.FromArgb(24, 32, 43),
+        }, 0, 0);
+
+        var hotkeyGrid = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 5,
+            RowCount = 5,
+        };
+        hotkeyGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 280));
+        hotkeyGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 70));
+        hotkeyGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 70));
+        hotkeyGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 70));
+        hotkeyGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        for (var row = 0; row < 5; row++)
+        {
+            hotkeyGrid.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
+        }
+
+        AddHeader(hotkeyGrid, 0, "Действие");
+        AddHeader(hotkeyGrid, 1, "Ctrl");
+        AddHeader(hotkeyGrid, 2, "Alt");
+        AddHeader(hotkeyGrid, 3, "Shift");
+        AddHeader(hotkeyGrid, 4, "Клавиша");
+        _convertWordHotkey.AddTo(hotkeyGrid, 1);
+        _convertSelectionHotkey.AddTo(hotkeyGrid, 2);
+        _undoHotkey.AddTo(hotkeyGrid, 3);
+        _pauseHotkey.AddTo(hotkeyGrid, 4);
+        layout.Controls.Add(hotkeyGrid, 0, 1);
+
+        var hotkeyButtons = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.LeftToRight,
+        };
+        ConfigureButton(_saveHotkeysButton, "Сохранить клавиши", 200);
+        ConfigureButton(_resetHotkeysButton, "Вернуть стандартные", 210);
+        hotkeyButtons.Controls.Add(_saveHotkeysButton);
+        hotkeyButtons.Controls.Add(_resetHotkeysButton);
+        layout.Controls.Add(hotkeyButtons, 0, 2);
+
+        layout.Controls.Add(new Label
+        {
+            Text = "Перенос настроек",
+            Dock = DockStyle.Fill,
+            Font = new Font("Segoe UI Semibold", 10F),
+            ForeColor = Color.FromArgb(24, 32, 43),
+        }, 0, 4);
+
+        var dataButtons = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.LeftToRight,
+        };
+        ConfigureButton(_exportSettingsButton, "Экспорт JSON", 160);
+        ConfigureButton(_importSettingsButton, "Импорт JSON", 160);
+        ConfigureButton(_showFirstRunHintButton, "Показать подсказку", 210);
+        dataButtons.Controls.Add(_exportSettingsButton);
+        dataButtons.Controls.Add(_importSettingsButton);
+        dataButtons.Controls.Add(_showFirstRunHintButton);
+        layout.Controls.Add(dataButtons, 0, 5);
+
+        layout.Controls.Add(new Label
+        {
+            Text = "Экспорт сохраняет основные настройки, списки, историю, звуки, автозапуск и горячие клавиши в один JSON-файл. При импорте текущие настройки заменяются.",
+            Dock = DockStyle.Fill,
+            ForeColor = Color.FromArgb(71, 85, 105),
+        }, 0, 6);
 
         return page;
     }
@@ -1381,6 +1637,11 @@ internal sealed class SettingsForm : Form
                 await _context.InstallUpdateAsync(_latestUpdate);
             }
         };
+        _saveHotkeysButton.Click += (_, _) => SaveHotkeys();
+        _resetHotkeysButton.Click += (_, _) => ResetHotkeys();
+        _exportSettingsButton.Click += (_, _) => ExportSettings();
+        _importSettingsButton.Click += (_, _) => ImportSettings();
+        _showFirstRunHintButton.Click += (_, _) => _context.ShowFirstRunHint(force: true);
     }
 
     private void UpdateStatus()
@@ -1389,6 +1650,130 @@ internal sealed class SettingsForm : Form
         if (string.IsNullOrWhiteSpace(_lastActionLabel.Text))
         {
             _lastActionLabel.Text = "Последнее действие: нет";
+        }
+    }
+
+    private void UpdateHotkeysLabel()
+    {
+        _hotkeysLabel.Text =
+            $"{_context.Settings.ConvertWordHotkey} - конвертировать текущее/последнее слово\r\n" +
+            $"{_context.Settings.ConvertSelectionHotkey} - конвертировать выделенный текст\r\n" +
+            $"{_context.Settings.UndoHotkey} - откатить последнее автоисправление\r\n" +
+            $"{_context.Settings.PauseHotkey} - включить или выключить паузу";
+    }
+
+    private void SaveHotkeys()
+    {
+        var hotkeys = new[]
+        {
+            _convertWordHotkey.Binding,
+            _convertSelectionHotkey.Binding,
+            _undoHotkey.Binding,
+            _pauseHotkey.Binding,
+        };
+
+        if (hotkeys.Any(binding => !binding.IsUsable))
+        {
+            MessageBox.Show(
+                this,
+                "Каждая комбинация должна содержать Ctrl или Alt и основную клавишу.",
+                "Switcher",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return;
+        }
+
+        if (HotkeyBinding.HasDuplicates(hotkeys))
+        {
+            MessageBox.Show(
+                this,
+                "Комбинации не должны повторяться.",
+                "Switcher",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return;
+        }
+
+        _context.UpdateSettings(s =>
+        {
+            s.ConvertWordHotkey = _convertWordHotkey.Binding;
+            s.ConvertSelectionHotkey = _convertSelectionHotkey.Binding;
+            s.UndoHotkey = _undoHotkey.Binding;
+            s.PauseHotkey = _pauseHotkey.Binding;
+        });
+    }
+
+    private void ResetHotkeys()
+    {
+        _context.UpdateSettings(s =>
+        {
+            s.ConvertWordHotkey = AppSettings.DefaultConvertWordHotkey();
+            s.ConvertSelectionHotkey = AppSettings.DefaultConvertSelectionHotkey();
+            s.UndoHotkey = AppSettings.DefaultUndoHotkey();
+            s.PauseHotkey = AppSettings.DefaultPauseHotkey();
+        });
+    }
+
+    private void ExportSettings()
+    {
+        using var dialog = new SaveFileDialog
+        {
+            Title = "Экспорт настроек Switcher",
+            Filter = "JSON (*.json)|*.json|Все файлы (*.*)|*.*",
+            FileName = $"Switcher-settings-{DateTime.Now:yyyyMMdd-HHmm}.json",
+            AddExtension = true,
+            DefaultExt = "json",
+        };
+
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        try
+        {
+            _context.ExportSettings(dialog.FileName);
+            MessageBox.Show(this, "Настройки экспортированы.", "Switcher", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, $"Не удалось экспортировать настройки:\r\n{ex.Message}", "Switcher", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    private void ImportSettings()
+    {
+        using var dialog = new OpenFileDialog
+        {
+            Title = "Импорт настроек Switcher",
+            Filter = "JSON (*.json)|*.json|Все файлы (*.*)|*.*",
+            CheckFileExists = true,
+        };
+
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        var result = MessageBox.Show(
+            this,
+            "Текущие настройки будут заменены настройками из файла. Продолжить?",
+            "Switcher",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Warning);
+        if (result != DialogResult.Yes)
+        {
+            return;
+        }
+
+        try
+        {
+            _context.ImportSettings(dialog.FileName);
+            MessageBox.Show(this, "Настройки импортированы.", "Switcher", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, $"Не удалось импортировать настройки:\r\n{ex.Message}", "Switcher", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
 
@@ -1574,16 +1959,218 @@ internal sealed class KeyboardHook : IDisposable
     }
 }
 
+internal sealed class HotkeyBinding
+{
+    public bool Ctrl { get; set; } = true;
+    public bool Alt { get; set; } = true;
+    public bool Shift { get; set; }
+    public Keys Key { get; set; } = Keys.None;
+
+    public bool IsUsable => (Ctrl || Alt) && AllowedKeys.Contains(Key);
+
+    public static IReadOnlyList<Keys> AllowedKeys { get; } = BuildAllowedKeys();
+
+    public static HotkeyBinding CtrlAlt(Keys key)
+    {
+        return new HotkeyBinding
+        {
+            Ctrl = true,
+            Alt = true,
+            Shift = false,
+            Key = key,
+        };
+    }
+
+    public static HotkeyBinding Normalize(HotkeyBinding? binding, HotkeyBinding fallback)
+    {
+        if (binding is null || !binding.IsUsable)
+        {
+            return fallback.Clone();
+        }
+
+        return binding.Clone();
+    }
+
+    public static bool SameChord(HotkeyBinding left, HotkeyBinding right)
+    {
+        return left.Ctrl == right.Ctrl
+            && left.Alt == right.Alt
+            && left.Shift == right.Shift
+            && left.Key == right.Key;
+    }
+
+    public static bool HasDuplicates(IEnumerable<HotkeyBinding> bindings)
+    {
+        var list = bindings.ToList();
+        return list
+            .Where(binding => binding.IsUsable)
+            .Select(binding => $"{binding.Ctrl}:{binding.Alt}:{binding.Shift}:{binding.Key}")
+            .Distinct(StringComparer.Ordinal)
+            .Count() != list.Count(binding => binding.IsUsable);
+    }
+
+    public static string KeyDisplayName(Keys key)
+    {
+        return key switch
+        {
+            Keys.Space => "Space",
+            Keys.Enter => "Enter",
+            Keys.Back => "Backspace",
+            Keys.Tab => "Tab",
+            Keys.Escape => "Esc",
+            _ => key.ToString(),
+        };
+    }
+
+    public HotkeyBinding Clone()
+    {
+        return new HotkeyBinding
+        {
+            Ctrl = Ctrl,
+            Alt = Alt,
+            Shift = Shift,
+            Key = Key,
+        };
+    }
+
+    public override string ToString()
+    {
+        var parts = new List<string>(4);
+        if (Ctrl)
+        {
+            parts.Add("Ctrl");
+        }
+
+        if (Alt)
+        {
+            parts.Add("Alt");
+        }
+
+        if (Shift)
+        {
+            parts.Add("Shift");
+        }
+
+        parts.Add(KeyDisplayName(Key));
+        return string.Join("+", parts);
+    }
+
+    private static Keys[] BuildAllowedKeys()
+    {
+        var keys = new List<Keys>
+        {
+            Keys.Space,
+            Keys.Enter,
+            Keys.Back,
+            Keys.Tab,
+            Keys.Escape,
+        };
+
+        for (var key = (int)Keys.A; key <= (int)Keys.Z; key++)
+        {
+            keys.Add((Keys)key);
+        }
+
+        for (var key = (int)Keys.F1; key <= (int)Keys.F12; key++)
+        {
+            keys.Add((Keys)key);
+        }
+
+        return keys.ToArray();
+    }
+}
+
+internal sealed class HotkeyRow
+{
+    private readonly Label _action = new();
+    private readonly CheckBox _ctrl = new();
+    private readonly CheckBox _alt = new();
+    private readonly CheckBox _shift = new();
+    private readonly ComboBox _key = new();
+
+    public HotkeyRow(string action)
+    {
+        _action.Text = action;
+        _action.Dock = DockStyle.Fill;
+        _action.TextAlign = ContentAlignment.MiddleLeft;
+        _ctrl.Dock = DockStyle.Fill;
+        _alt.Dock = DockStyle.Fill;
+        _shift.Dock = DockStyle.Fill;
+        _key.Dock = DockStyle.Fill;
+        _key.DropDownStyle = ComboBoxStyle.DropDownList;
+        foreach (var key in HotkeyBinding.AllowedKeys)
+        {
+            _key.Items.Add(new KeyOption(key));
+        }
+    }
+
+    public HotkeyBinding Binding => new()
+    {
+        Ctrl = _ctrl.Checked,
+        Alt = _alt.Checked,
+        Shift = _shift.Checked,
+        Key = SelectedKey,
+    };
+
+    public void AddTo(TableLayoutPanel layout, int row)
+    {
+        layout.Controls.Add(_action, 0, row);
+        layout.Controls.Add(_ctrl, 1, row);
+        layout.Controls.Add(_alt, 2, row);
+        layout.Controls.Add(_shift, 3, row);
+        layout.Controls.Add(_key, 4, row);
+    }
+
+    public void SetBinding(HotkeyBinding binding)
+    {
+        _ctrl.Checked = binding.Ctrl;
+        _alt.Checked = binding.Alt;
+        _shift.Checked = binding.Shift;
+        foreach (var item in _key.Items.OfType<KeyOption>())
+        {
+            if (item.Key == binding.Key)
+            {
+                _key.SelectedItem = item;
+                return;
+            }
+        }
+
+        _key.SelectedIndex = 0;
+    }
+
+    private Keys SelectedKey => _key.SelectedItem is KeyOption option
+        ? option.Key
+        : HotkeyBinding.AllowedKeys[0];
+
+    private sealed record KeyOption(Keys Key)
+    {
+        public override string ToString()
+        {
+            return HotkeyBinding.KeyDisplayName(Key);
+        }
+    }
+}
+
 internal sealed record AppSettings
 {
+    public static HotkeyBinding DefaultConvertWordHotkey() => HotkeyBinding.CtrlAlt(Keys.Space);
+    public static HotkeyBinding DefaultConvertSelectionHotkey() => HotkeyBinding.CtrlAlt(Keys.Enter);
+    public static HotkeyBinding DefaultUndoHotkey() => HotkeyBinding.CtrlAlt(Keys.Back);
+    public static HotkeyBinding DefaultPauseHotkey() => HotkeyBinding.CtrlAlt(Keys.P);
+
     public bool AutoSwitch { get; set; } = true;
     public bool Paused { get; set; }
     public bool Sound { get; set; } = true;
     public bool StartWithWindows { get; set; }
     public bool AutoCheckUpdates { get; set; } = true;
+    public bool FirstRunHintShown { get; set; }
     public DateTime? LastUpdateCheckUtc { get; set; }
     public string EnToRuSound { get; set; } = SoundPlayerNames.Asterisk;
     public string RuToEnSound { get; set; } = SoundPlayerNames.Question;
+    public HotkeyBinding ConvertWordHotkey { get; set; } = DefaultConvertWordHotkey();
+    public HotkeyBinding ConvertSelectionHotkey { get; set; } = DefaultConvertSelectionHotkey();
+    public HotkeyBinding UndoHotkey { get; set; } = DefaultUndoHotkey();
+    public HotkeyBinding PauseHotkey { get; set; } = DefaultPauseHotkey();
     public List<string> ExcludedProcesses { get; set; } =
     [
         "1password",
@@ -1658,6 +2245,12 @@ internal static class SettingsStore
 
     private static readonly string SettingsPath = Path.Combine(DirectoryPath, "settings.json");
 
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        WriteIndented = true,
+        Converters = { new JsonStringEnumConverter() },
+    };
+
     public static AppSettings Load()
     {
         try
@@ -1668,7 +2261,7 @@ internal static class SettingsStore
             }
 
             var json = File.ReadAllText(SettingsPath, Encoding.UTF8);
-            return Normalize(JsonSerializer.Deserialize<AppSettings>(json) ?? new AppSettings());
+            return Normalize(JsonSerializer.Deserialize<AppSettings>(json, JsonOptions) ?? new AppSettings());
         }
         catch
         {
@@ -1676,18 +2269,57 @@ internal static class SettingsStore
         }
     }
 
+    public static AppSettings LoadFromFile(string path)
+    {
+        if (!File.Exists(path))
+        {
+            throw new FileNotFoundException("Файл настроек не найден.", path);
+        }
+
+        var json = File.ReadAllText(path, Encoding.UTF8);
+        return Normalize(JsonSerializer.Deserialize<AppSettings>(json, JsonOptions)
+            ?? throw new InvalidOperationException("Файл настроек пустой или повреждён."));
+    }
+
     public static void Save(AppSettings settings)
     {
+        SaveToFile(settings, SettingsPath);
+    }
+
+    public static void SaveToFile(AppSettings settings, string path)
+    {
         Normalize(settings);
-        Directory.CreateDirectory(DirectoryPath);
-        var json = JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true });
-        File.WriteAllText(SettingsPath, json, Encoding.UTF8);
+        var directory = Path.GetDirectoryName(Path.GetFullPath(path));
+        if (!string.IsNullOrEmpty(directory))
+        {
+            Directory.CreateDirectory(directory);
+        }
+
+        var json = JsonSerializer.Serialize(settings, JsonOptions);
+        File.WriteAllText(path, json, Encoding.UTF8);
     }
 
     private static AppSettings Normalize(AppSettings settings)
     {
         settings.EnToRuSound = NormalizeSound(settings.EnToRuSound, SoundPlayerNames.Asterisk);
         settings.RuToEnSound = NormalizeSound(settings.RuToEnSound, SoundPlayerNames.Question);
+        settings.ConvertWordHotkey = HotkeyBinding.Normalize(settings.ConvertWordHotkey, AppSettings.DefaultConvertWordHotkey());
+        settings.ConvertSelectionHotkey = HotkeyBinding.Normalize(settings.ConvertSelectionHotkey, AppSettings.DefaultConvertSelectionHotkey());
+        settings.UndoHotkey = HotkeyBinding.Normalize(settings.UndoHotkey, AppSettings.DefaultUndoHotkey());
+        settings.PauseHotkey = HotkeyBinding.Normalize(settings.PauseHotkey, AppSettings.DefaultPauseHotkey());
+        if (HotkeyBinding.HasDuplicates([
+            settings.ConvertWordHotkey,
+            settings.ConvertSelectionHotkey,
+            settings.UndoHotkey,
+            settings.PauseHotkey,
+        ]))
+        {
+            settings.ConvertWordHotkey = AppSettings.DefaultConvertWordHotkey();
+            settings.ConvertSelectionHotkey = AppSettings.DefaultConvertSelectionHotkey();
+            settings.UndoHotkey = AppSettings.DefaultUndoHotkey();
+            settings.PauseHotkey = AppSettings.DefaultPauseHotkey();
+        }
+
         settings.ExcludedProcesses ??= [];
         settings.CustomRussianWords ??= [];
         settings.CustomEnglishWords ??= [];
@@ -2184,7 +2816,16 @@ internal static class TextHeuristics
         "обновить", "скопировать", "вставить", "директор", "менеджер", "админ", "адрес",
         "телефон", "номер", "город", "москва", "россия", "время", "день", "ночь", "утро",
         "вечер", "хорошо", "плохо", "важно", "срочно", "проверка", "решение", "проблема",
-        "версия", "релиз", "коммит", "ветка", "репозиторий",
+        "версия", "релиз", "коммит", "ветка", "репозиторий", "программа", "утилита",
+        "пользователь", "пользователи", "профиль", "запуск", "автозагрузка", "обновление",
+        "скачать", "установить", "установка", "импорт", "экспорт", "горячие", "клавиши",
+        "клавиатура", "выделение", "буфер", "обмен", "копия", "ошибки", "исправление",
+        "подсказка", "инструкция", "помощь", "раздел", "вкладка", "справка", "путь",
+        "локально", "локальный", "параметр", "параметры", "проверить", "собрать",
+        "выпустить", "опубликовать", "скачивание", "фоновая", "фон", "тихо", "быстро",
+        "медленно", "работает", "запущено", "установлено", "доступно", "найдено",
+        "ссылка", "окей", "понял", "давай", "нормально", "класс", "супер", "сейчас",
+        "потом", "после", "перед", "первый", "последний", "новый", "старый", "общий",
     };
 
     private static readonly HashSet<string> EnglishWords = new(StringComparer.OrdinalIgnoreCase)
@@ -2204,7 +2845,15 @@ internal static class TextHeuristics
         "commit", "branch", "repository", "user", "name", "value", "key", "token", "api",
         "my", "me", "we", "us", "it", "is", "am", "hi", "in", "on", "of", "to", "as", "at",
         "if", "do", "go", "he", "she", "you", "not", "and", "but", "can", "may",
-        "github", "windows", "keyboard", "shortcut", "hotkey", "design",
+        "github", "windows", "keyboard", "shortcut", "hotkey", "design", "program",
+        "utility", "profile", "startup", "autostart", "install", "installer", "portable",
+        "download", "upload", "import", "export", "json", "background", "silent",
+        "notification", "tray", "menu", "dialog", "selection", "clipboard", "copy",
+        "versioning", "publish", "artifact", "workflow", "action", "local", "global",
+        "parameter", "option", "check", "compile", "create", "read", "write", "edit",
+        "settings", "configuration", "config", "help", "hint", "guide", "first", "last",
+        "new", "old", "current", "latest", "available", "found", "path", "link",
+        "normal", "class", "super", "now", "later", "before", "after", "next",
     };
 
     private static readonly string[] RussianFragments =
@@ -2520,6 +3169,15 @@ internal static class KeyboardState
     public static bool IsCtrlAltDown()
     {
         return IsKeyDown(Keys.ControlKey) && IsKeyDown(Keys.Menu);
+    }
+
+    public static bool Matches(HotkeyBinding binding, Keys key)
+    {
+        return binding.IsUsable
+            && key == binding.Key
+            && IsKeyDown(Keys.ControlKey) == binding.Ctrl
+            && IsKeyDown(Keys.Menu) == binding.Alt
+            && IsKeyDown(Keys.ShiftKey) == binding.Shift;
     }
 
     public static bool HasCommandModifierDown()
