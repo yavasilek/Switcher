@@ -16,12 +16,6 @@ internal static class Program
     [STAThread]
     private static void Main(string[] args)
     {
-        using var mutex = new Mutex(true, MutexName, out var createdNew);
-        if (!createdNew)
-        {
-            return;
-        }
-
         if (args.Length > 0)
         {
             if (args.Contains("--self-test", StringComparer.OrdinalIgnoreCase))
@@ -53,6 +47,12 @@ internal static class Program
                 InstallManager.RemoveInstalledCopy();
                 return;
             }
+        }
+
+        using var mutex = new Mutex(true, MutexName, out var createdNew);
+        if (!createdNew)
+        {
+            return;
         }
 
         ApplicationConfiguration.Initialize();
@@ -965,8 +965,9 @@ internal sealed class SettingsForm : Form
         _context = context;
         Text = "Switcher";
         StartPosition = FormStartPosition.CenterScreen;
-        MinimumSize = new Size(720, 560);
-        ClientSize = new Size(780, 600);
+        AutoScaleMode = AutoScaleMode.Dpi;
+        MinimumSize = new Size(860, 650);
+        ClientSize = new Size(920, 680);
         Font = new Font("Segoe UI", 10F);
         BackColor = Color.FromArgb(247, 249, 252);
 
@@ -977,10 +978,10 @@ internal sealed class SettingsForm : Form
             RowCount = 4,
             ColumnCount = 1,
         };
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 46));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 52));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 50));
         Controls.Add(root);
 
         root.Controls.Add(new Label
@@ -1013,8 +1014,8 @@ internal sealed class SettingsForm : Form
         var close = new Button
         {
             Text = "Свернуть",
-            Width = 110,
-            Height = 34,
+            Width = 130,
+            Height = 36,
         };
         close.Click += (_, _) => Close();
         buttons.Controls.Add(close);
@@ -1096,13 +1097,13 @@ internal sealed class SettingsForm : Form
         };
         for (var i = 0; i < 5; i++)
         {
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
         }
 
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 92));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 72));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 108));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 84));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         page.Controls.Add(layout);
 
@@ -1131,7 +1132,7 @@ internal sealed class SettingsForm : Form
         };
         soundGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 170));
         soundGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        soundGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 110));
+        soundGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 160));
         ConfigureCombo(_enToRuSound);
         ConfigureCombo(_ruToEnSound);
         AddSoundRow(soundGrid, 0, "EN -> RU", _enToRuSound, () => _context.TestSound(LayoutDirection.LatinToCyrillic));
@@ -1234,14 +1235,14 @@ internal sealed class SettingsForm : Form
             RowCount = 9,
             ColumnCount = 1,
         };
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 70));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 24));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 54));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 54));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 92));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 76));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 72));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         page.Controls.Add(layout);
 
@@ -1254,6 +1255,7 @@ internal sealed class SettingsForm : Form
 
         _installStatus.Dock = DockStyle.Fill;
         _installStatus.ForeColor = Color.FromArgb(51, 65, 85);
+        _installStatus.AutoEllipsis = false;
         layout.Controls.Add(_installStatus, 0, 1);
 
         var installButtons = new FlowLayoutPanel
@@ -1261,8 +1263,8 @@ internal sealed class SettingsForm : Form
             Dock = DockStyle.Fill,
             FlowDirection = FlowDirection.LeftToRight,
         };
-        ConfigureButton(_installButton, "Установить в систему", 170);
-        ConfigureButton(_uninstallButton, "Удалить установку", 150);
+        ConfigureButton(_installButton, "Установить в систему", 230);
+        ConfigureButton(_uninstallButton, "Удалить установку", 190);
         installButtons.Controls.Add(_installButton);
         installButtons.Controls.Add(_uninstallButton);
         layout.Controls.Add(installButtons, 0, 2);
@@ -1279,6 +1281,7 @@ internal sealed class SettingsForm : Form
 
         _updateStatus.Dock = DockStyle.Fill;
         _updateStatus.ForeColor = Color.FromArgb(51, 65, 85);
+        _updateStatus.AutoEllipsis = false;
         layout.Controls.Add(_updateStatus, 0, 5);
 
         var updateButtons = new FlowLayoutPanel
@@ -1286,8 +1289,8 @@ internal sealed class SettingsForm : Form
             Dock = DockStyle.Fill,
             FlowDirection = FlowDirection.LeftToRight,
         };
-        ConfigureButton(_checkUpdateButton, "Проверить обновления", 180);
-        ConfigureButton(_installUpdateButton, "Установить обновление", 180);
+        ConfigureButton(_checkUpdateButton, "Проверить обновления", 230);
+        ConfigureButton(_installUpdateButton, "Установить обновление", 240);
         _installUpdateButton.Enabled = false;
         updateButtons.Controls.Add(_checkUpdateButton);
         updateButtons.Controls.Add(_installUpdateButton);
@@ -1439,6 +1442,7 @@ internal sealed class SettingsForm : Form
         checkBox.Dock = DockStyle.Fill;
         checkBox.ForeColor = Color.FromArgb(24, 32, 43);
         checkBox.AutoSize = false;
+        checkBox.TextAlign = ContentAlignment.MiddleLeft;
     }
 
     private static void ConfigureCombo(ComboBox combo)
@@ -1452,7 +1456,7 @@ internal sealed class SettingsForm : Form
     {
         button.Text = text;
         button.Width = width;
-        button.Height = 32;
+        button.Height = 36;
     }
 
     private static void ConfigureTextArea(TextBox textBox)
@@ -1468,7 +1472,7 @@ internal sealed class SettingsForm : Form
 
     private static void AddSoundRow(TableLayoutPanel grid, int row, string label, ComboBox combo, Action test)
     {
-        grid.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+        grid.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
         grid.Controls.Add(new Label
         {
             Text = label,
@@ -1480,6 +1484,7 @@ internal sealed class SettingsForm : Form
         {
             Text = "Проверить",
             Dock = DockStyle.Fill,
+            MinimumSize = new Size(140, 34),
         };
         button.Click += (_, _) => test();
         grid.Controls.Add(button, 2, row);
