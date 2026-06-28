@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Drawing.Drawing2D;
 using System.Media;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
@@ -31,13 +32,25 @@ internal static class Program
 
             if (args.Contains("--install-startup", StringComparer.OrdinalIgnoreCase))
             {
-                StartupManager.SetEnabled(true);
+                StartupManager.SetEnabled(true, Application.ExecutablePath);
                 return;
             }
 
             if (args.Contains("--uninstall-startup", StringComparer.OrdinalIgnoreCase))
             {
                 StartupManager.SetEnabled(false);
+                return;
+            }
+
+            if (args.Contains("--install", StringComparer.OrdinalIgnoreCase))
+            {
+                InstallManager.InstallCurrentExecutable();
+                return;
+            }
+
+            if (args.Contains("--uninstall", StringComparer.OrdinalIgnoreCase))
+            {
+                InstallManager.RemoveInstalledCopy();
                 return;
             }
         }
@@ -146,7 +159,7 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
     public SwitcherApplicationContext()
     {
         _settings = SettingsStore.Load();
-        _settings.StartWithWindows = StartupManager.IsEnabled();
+        _settings.StartWithWindows = StartupManager.IsEnabledForPath(InstallManager.PreferredStartupPath);
         _uiThread.CreateControl();
 
         _notifyIcon = new NotifyIcon
@@ -184,6 +197,24 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
     }
 
     public IReadOnlyList<CorrectionHistoryItem> History => _settings.History;
+
+    public string InstallationStatus
+    {
+        get
+        {
+            if (InstallManager.IsCurrentInstanceInstalled)
+            {
+                return $"Установлено: {InstallManager.InstalledExePath}";
+            }
+
+            if (InstallManager.IsInstalled)
+            {
+                return $"Запущена portable-версия. Установленная копия: {InstallManager.InstalledExePath}";
+            }
+
+            return "Запущена portable-версия. В систему не установлено.";
+        }
+    }
 
     public void UpdateSettings(Action<AppSettings> update)
     {
@@ -228,13 +259,25 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         };
         var startupItem = new ToolStripMenuItem("Запускать с Windows", null, (_, _) =>
         {
-            var enabled = !StartupManager.IsEnabled();
-            StartupManager.SetEnabled(enabled);
+            var enabled = !StartupManager.IsEnabledForPath(InstallManager.PreferredStartupPath);
+            StartupManager.SetEnabled(enabled, InstallManager.PreferredStartupPath);
             UpdateSettings(s => s.StartWithWindows = enabled);
         })
         {
             Name = "Startup",
         };
+        var installItem = new ToolStripMenuItem("Установить в систему", null, (_, _) => InstallToSystem())
+        {
+            Name = "Install",
+        };
+        var checkUpdatesItem = new ToolStripMenuItem("Проверить обновления", null, async (_, _) =>
+        {
+            var update = await CheckForUpdatesAsync();
+            if (update?.IsNewer == true)
+            {
+                await InstallUpdateAsync(update);
+            }
+        });
         var convertItem = new ToolStripMenuItem("Конвертировать последнее слово: Ctrl+Alt+Space");
         convertItem.Enabled = false;
         var convertSelectionItem = new ToolStripMenuItem("Конвертировать выделенный текст: Ctrl+Alt+Enter");
@@ -252,6 +295,8 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
             soundItem,
             pauseItem,
             startupItem,
+            installItem,
+            checkUpdatesItem,
             new ToolStripSeparator(),
             convertItem,
             convertSelectionItem,
@@ -296,9 +341,15 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
 
         if (menu.Items["Startup"] is ToolStripMenuItem startupItem)
         {
-            _settings.StartWithWindows = StartupManager.IsEnabled();
+            _settings.StartWithWindows = StartupManager.IsEnabledForPath(InstallManager.PreferredStartupPath);
             startupItem.Checked = _settings.StartWithWindows;
             startupItem.Text = _settings.StartWithWindows ? "Запускать с Windows: да" : "Запускать с Windows: нет";
+        }
+
+        if (menu.Items["Install"] is ToolStripMenuItem installItem)
+        {
+            installItem.Enabled = !InstallManager.IsCurrentInstanceInstalled;
+            installItem.Text = InstallManager.IsCurrentInstanceInstalled ? "Уже установлено в систему" : "Установить в систему";
         }
     }
 
@@ -572,6 +623,127 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         UpdateBalloon("Пауза", _settings.Paused ? "включена" : "выключена");
     }
 
+    public void InstallToSystem()
+    {
+        try
+        {
+            var installedPath = InstallManager.InstallCurrentExecutable();
+            _settings.StartWithWindows = StartupManager.IsEnabledForPath(installedPath);
+            SettingsStore.Save(_settings);
+            RefreshMenu();
+            _settingsForm?.RefreshFromSettings();
+
+            if (!InstallManager.IsCurrentInstanceInstalled)
+            {
+                var result = MessageBox.Show(
+                    $"Switcher установлен в:\r\n{installedPath}\r\n\r\nЗапустить установленную версию сейчас?",
+                    "Switcher",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Information);
+
+                if (result == DialogResult.Yes)
+                {
+                    Process.Start(new ProcessStartInfo
+                    {
+                        FileName = installedPath,
+                        UseShellExecute = true,
+                    });
+                    ExitThread();
+                }
+            }
+            else
+            {
+                MessageBox.Show("Текущая копия уже установлена.", "Switcher", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Не удалось установить Switcher:\r\n{ex.Message}", "Switcher", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    public void UninstallFromSystem()
+    {
+        try
+        {
+            if (!InstallManager.IsInstalled)
+            {
+                MessageBox.Show("Установленная копия не найдена.", "Switcher", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            if (InstallManager.IsCurrentInstanceInstalled)
+            {
+                var result = MessageBox.Show(
+                    "Установленная копия будет удалена после закрытия Switcher. Продолжить?",
+                    "Switcher",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Warning);
+                if (result != DialogResult.Yes)
+                {
+                    return;
+                }
+
+                InstallManager.RemoveInstalledCopy();
+                ExitThread();
+                return;
+            }
+
+            InstallManager.RemoveInstalledCopy();
+            _settings.StartWithWindows = false;
+            SettingsStore.Save(_settings);
+            RefreshMenu();
+            _settingsForm?.RefreshFromSettings();
+            MessageBox.Show("Установленная копия удалена.", "Switcher", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Не удалось удалить установленную копию:\r\n{ex.Message}", "Switcher", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    public async Task<UpdateInfo?> CheckForUpdatesAsync()
+    {
+        try
+        {
+            var update = await UpdateManager.CheckLatestAsync();
+            var message = update.IsNewer
+                ? $"Доступна новая версия {update.TagName}.\r\nТекущая версия: v{ApplicationInfo.CurrentVersionText}"
+                : $"Установлена актуальная версия v{ApplicationInfo.CurrentVersionText}.";
+            MessageBox.Show(message, "Switcher", MessageBoxButtons.OK, update.IsNewer ? MessageBoxIcon.Information : MessageBoxIcon.None);
+            return update;
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Не удалось проверить обновления:\r\n{ex.Message}", "Switcher", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return null;
+        }
+    }
+
+    public async Task InstallUpdateAsync(UpdateInfo update)
+    {
+        try
+        {
+            var result = MessageBox.Show(
+                $"Скачать и установить {update.TagName}?\r\n\r\nSwitcher будет перезапущен.",
+                "Switcher",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Question);
+            if (result != DialogResult.Yes)
+            {
+                return;
+            }
+
+            var downloadedExe = await UpdateManager.DownloadUpdateAsync(update);
+            InstallManager.ScheduleReplacement(downloadedExe, Application.ExecutablePath, Environment.ProcessId);
+            ExitThread();
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Не удалось установить обновление:\r\n{ex.Message}", "Switcher", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
     private void PostToUi(Action action)
     {
         if (_uiThread.IsDisposed)
@@ -668,6 +840,13 @@ internal sealed class SettingsForm : Form
     private readonly TextBox _russianWords = new();
     private readonly TextBox _englishWords = new();
     private readonly ListBox _history = new();
+    private readonly Label _installStatus = new();
+    private readonly Label _updateStatus = new();
+    private readonly Button _installButton = new();
+    private readonly Button _uninstallButton = new();
+    private readonly Button _checkUpdateButton = new();
+    private readonly Button _installUpdateButton = new();
+    private UpdateInfo? _latestUpdate;
     private bool _updating;
 
     public SettingsForm(SwitcherApplicationContext context)
@@ -712,6 +891,7 @@ internal sealed class SettingsForm : Form
         tabs.TabPages.Add(CreateGeneralTab());
         tabs.TabPages.Add(CreateListsTab());
         tabs.TabPages.Add(CreateHistoryTab());
+        tabs.TabPages.Add(CreateInstallTab());
         root.Controls.Add(tabs, 0, 2);
 
         var buttons = new FlowLayoutPanel
@@ -739,7 +919,7 @@ internal sealed class SettingsForm : Form
         _autoSwitch.Checked = _context.Settings.AutoSwitch;
         _sound.Checked = _context.Settings.Sound;
         _paused.Checked = _context.Settings.Paused;
-        _startup.Checked = StartupManager.IsEnabled();
+        _startup.Checked = StartupManager.IsEnabledForPath(InstallManager.PreferredStartupPath);
         SetComboValue(_enToRuSound, _context.Settings.EnToRuSound);
         SetComboValue(_ruToEnSound, _context.Settings.RuToEnSound);
         _excludedProcesses.Text = LinesFrom(_context.Settings.ExcludedProcesses);
@@ -749,6 +929,7 @@ internal sealed class SettingsForm : Form
 
         UpdateStatus();
         RefreshHistory();
+        RefreshInstallState();
     }
 
     public void RefreshHistory()
@@ -931,6 +1112,81 @@ internal sealed class SettingsForm : Form
         return page;
     }
 
+    private TabPage CreateInstallTab()
+    {
+        var page = new TabPage("Установка");
+        var layout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            Padding = new Padding(14),
+            RowCount = 8,
+            ColumnCount = 1,
+        };
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 70));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 24));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 54));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 54));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        page.Controls.Add(layout);
+
+        layout.Controls.Add(new Label
+        {
+            Text = $"Версия: v{ApplicationInfo.CurrentVersionText}",
+            Dock = DockStyle.Fill,
+            Font = new Font("Segoe UI Semibold", 10F),
+        }, 0, 0);
+
+        _installStatus.Dock = DockStyle.Fill;
+        _installStatus.ForeColor = Color.FromArgb(51, 65, 85);
+        layout.Controls.Add(_installStatus, 0, 1);
+
+        var installButtons = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.LeftToRight,
+        };
+        ConfigureButton(_installButton, "Установить в систему", 170);
+        ConfigureButton(_uninstallButton, "Удалить установку", 150);
+        installButtons.Controls.Add(_installButton);
+        installButtons.Controls.Add(_uninstallButton);
+        layout.Controls.Add(installButtons, 0, 2);
+
+        layout.Controls.Add(new Label
+        {
+            Text = "Обновления",
+            Dock = DockStyle.Fill,
+            Font = new Font("Segoe UI Semibold", 10F),
+        }, 0, 3);
+
+        _updateStatus.Dock = DockStyle.Fill;
+        _updateStatus.ForeColor = Color.FromArgb(51, 65, 85);
+        layout.Controls.Add(_updateStatus, 0, 4);
+
+        var updateButtons = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.LeftToRight,
+        };
+        ConfigureButton(_checkUpdateButton, "Проверить обновления", 180);
+        ConfigureButton(_installUpdateButton, "Установить обновление", 180);
+        _installUpdateButton.Enabled = false;
+        updateButtons.Controls.Add(_checkUpdateButton);
+        updateButtons.Controls.Add(_installUpdateButton);
+        layout.Controls.Add(updateButtons, 0, 5);
+
+        layout.Controls.Add(new Label
+        {
+            Text = "Установка выполняется без прав администратора в профиль пользователя. Обновление скачивает последний Switcher.exe из GitHub Releases и заменяет текущий файл после закрытия приложения.",
+            Dock = DockStyle.Fill,
+            ForeColor = Color.FromArgb(71, 85, 105),
+        }, 0, 6);
+
+        return page;
+    }
+
     private void BindEvents()
     {
         _autoSwitch.CheckedChanged += (_, _) =>
@@ -961,7 +1217,7 @@ internal sealed class SettingsForm : Form
                 return;
             }
 
-            StartupManager.SetEnabled(_startup.Checked);
+            StartupManager.SetEnabled(_startup.Checked, InstallManager.PreferredStartupPath);
             _context.UpdateSettings(s => s.StartWithWindows = _startup.Checked);
         };
         _enToRuSound.SelectedIndexChanged += (_, _) =>
@@ -978,6 +1234,27 @@ internal sealed class SettingsForm : Form
                 _context.UpdateSettings(s => s.RuToEnSound = value);
             }
         };
+        _installButton.Click += (_, _) =>
+        {
+            _context.InstallToSystem();
+            RefreshInstallState();
+        };
+        _uninstallButton.Click += (_, _) =>
+        {
+            _context.UninstallFromSystem();
+            RefreshInstallState();
+        };
+        _checkUpdateButton.Click += async (_, _) =>
+        {
+            await CheckUpdatesFromFormAsync();
+        };
+        _installUpdateButton.Click += async (_, _) =>
+        {
+            if (_latestUpdate is not null)
+            {
+                await _context.InstallUpdateAsync(_latestUpdate);
+            }
+        };
     }
 
     private void UpdateStatus()
@@ -986,6 +1263,35 @@ internal sealed class SettingsForm : Form
         if (string.IsNullOrWhiteSpace(_lastActionLabel.Text))
         {
             _lastActionLabel.Text = "Последнее действие: нет";
+        }
+    }
+
+    private void RefreshInstallState()
+    {
+        _installStatus.Text = _context.InstallationStatus;
+        _installButton.Enabled = !InstallManager.IsCurrentInstanceInstalled;
+        _uninstallButton.Enabled = InstallManager.IsInstalled;
+        _updateStatus.Text = _latestUpdate is null
+            ? "Обновления ещё не проверялись."
+            : _latestUpdate.IsNewer
+                ? $"Доступна версия {_latestUpdate.TagName}."
+                : $"Установлена актуальная версия v{ApplicationInfo.CurrentVersionText}.";
+        _installUpdateButton.Enabled = _latestUpdate?.IsNewer == true;
+    }
+
+    private async Task CheckUpdatesFromFormAsync()
+    {
+        _checkUpdateButton.Enabled = false;
+        _installUpdateButton.Enabled = false;
+        _updateStatus.Text = "Проверяю GitHub Releases...";
+        try
+        {
+            _latestUpdate = await _context.CheckForUpdatesAsync();
+        }
+        finally
+        {
+            _checkUpdateButton.Enabled = true;
+            RefreshInstallState();
         }
     }
 
@@ -1002,6 +1308,13 @@ internal sealed class SettingsForm : Form
         combo.DropDownStyle = ComboBoxStyle.DropDownList;
         combo.Dock = DockStyle.Fill;
         combo.Items.AddRange(SoundPlayerNames.All.Cast<object>().ToArray());
+    }
+
+    private static void ConfigureButton(Button button, string text, int width)
+    {
+        button.Text = text;
+        button.Width = width;
+        button.Height = 32;
     }
 
     private static void ConfigureTextArea(TextBox textBox)
@@ -1266,12 +1579,17 @@ internal static class StartupManager
 
     public static bool IsEnabled()
     {
-        using var key = Registry.CurrentUser.OpenSubKey(RunKey, false);
-        return key?.GetValue(ValueName) is string value
-            && value.Contains(Application.ExecutablePath, StringComparison.OrdinalIgnoreCase);
+        return IsEnabledForPath(Application.ExecutablePath);
     }
 
-    public static void SetEnabled(bool enabled)
+    public static bool IsEnabledForPath(string executablePath)
+    {
+        using var key = Registry.CurrentUser.OpenSubKey(RunKey, false);
+        return key?.GetValue(ValueName) is string value
+            && value.Contains(executablePath, StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static void SetEnabled(bool enabled, string? executablePath = null)
     {
         using var key = Registry.CurrentUser.OpenSubKey(RunKey, true);
         if (key is null)
@@ -1281,12 +1599,262 @@ internal static class StartupManager
 
         if (enabled)
         {
-            key.SetValue(ValueName, $"\"{Application.ExecutablePath}\"");
+            key.SetValue(ValueName, $"\"{executablePath ?? Application.ExecutablePath}\"");
         }
         else
         {
             key.DeleteValue(ValueName, false);
         }
+    }
+}
+
+internal static class ApplicationInfo
+{
+    public const string Repository = "yavasilek/Switcher";
+    public const string LatestReleaseApiUrl = "https://api.github.com/repos/yavasilek/Switcher/releases/latest";
+    public const string ReleasesUrl = "https://github.com/yavasilek/Switcher/releases";
+
+    public static Version CurrentVersion { get; } = GetCurrentVersion();
+
+    public static string CurrentVersionText => CurrentVersion.ToString(3);
+
+    private static Version GetCurrentVersion()
+    {
+        var informational = typeof(Program).Assembly
+            .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?
+            .InformationalVersion
+            .Split('+', 2)[0];
+
+        if (Version.TryParse(informational, out var version))
+        {
+            return version;
+        }
+
+        return typeof(Program).Assembly.GetName().Version ?? new Version(0, 0, 0);
+    }
+}
+
+internal static class InstallManager
+{
+    private const string AppFolderName = "Switcher";
+    private const string ExeName = "Switcher.exe";
+
+    public static string InstallDirectory => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "Programs",
+        AppFolderName);
+
+    public static string InstalledExePath => Path.Combine(InstallDirectory, ExeName);
+
+    public static string PreferredStartupPath => IsInstalled ? InstalledExePath : Application.ExecutablePath;
+
+    public static bool IsCurrentInstanceInstalled => SamePath(Application.ExecutablePath, InstalledExePath);
+
+    public static bool IsInstalled => File.Exists(InstalledExePath);
+
+    public static string InstallCurrentExecutable()
+    {
+        Directory.CreateDirectory(InstallDirectory);
+        var current = Path.GetFullPath(Application.ExecutablePath);
+        var installed = Path.GetFullPath(InstalledExePath);
+
+        if (!SamePath(current, installed))
+        {
+            File.Copy(current, installed, true);
+        }
+
+        StartupManager.SetEnabled(true, installed);
+        CreateStartMenuShortcut(installed);
+        return installed;
+    }
+
+    public static void RemoveInstalledCopy()
+    {
+        StartupManager.SetEnabled(false);
+        DeleteStartMenuShortcut();
+        if (IsCurrentInstanceInstalled)
+        {
+            ScheduleDirectoryDeleteAfterExit(InstallDirectory, Environment.ProcessId);
+            return;
+        }
+
+        if (Directory.Exists(InstallDirectory))
+        {
+            Directory.Delete(InstallDirectory, true);
+        }
+    }
+
+    public static void ScheduleReplacement(string sourceExe, string targetExe, int processId)
+    {
+        var scriptPath = Path.Combine(Path.GetTempPath(), $"Switcher.Update.{Guid.NewGuid():N}.cmd");
+        var script = $"""
+@echo off
+setlocal
+:wait
+tasklist /FI "PID eq {processId}" 2>NUL | find "{processId}" >NUL
+if not errorlevel 1 (
+  timeout /t 1 /nobreak >NUL
+  goto wait
+)
+copy /Y "{sourceExe}" "{targetExe}" >NUL
+del /F /Q "{sourceExe}" >NUL 2>NUL
+start "" "{targetExe}" --updated
+del "%~f0" >NUL 2>NUL
+""";
+        File.WriteAllText(scriptPath, script, Encoding.ASCII);
+        StartHidden("cmd.exe", $"/c \"{scriptPath}\"");
+    }
+
+    private static void ScheduleDirectoryDeleteAfterExit(string directory, int processId)
+    {
+        var scriptPath = Path.Combine(Path.GetTempPath(), $"Switcher.Uninstall.{Guid.NewGuid():N}.cmd");
+        var script = $"""
+@echo off
+setlocal
+:wait
+tasklist /FI "PID eq {processId}" 2>NUL | find "{processId}" >NUL
+if not errorlevel 1 (
+  timeout /t 1 /nobreak >NUL
+  goto wait
+)
+rmdir /S /Q "{directory}" >NUL 2>NUL
+del "%~f0" >NUL 2>NUL
+""";
+        File.WriteAllText(scriptPath, script, Encoding.ASCII);
+        StartHidden("cmd.exe", $"/c \"{scriptPath}\"");
+    }
+
+    private static void CreateStartMenuShortcut(string installedExe)
+    {
+        var shortcutPath = GetStartMenuShortcutPath();
+        Directory.CreateDirectory(Path.GetDirectoryName(shortcutPath)!);
+        var scriptPath = Path.Combine(Path.GetTempPath(), $"Switcher.Shortcut.{Guid.NewGuid():N}.ps1");
+        var script = $"""
+$shell = New-Object -ComObject WScript.Shell
+$shortcut = $shell.CreateShortcut('{EscapePowerShellSingleQuoted(shortcutPath)}')
+$shortcut.TargetPath = '{EscapePowerShellSingleQuoted(installedExe)}'
+$shortcut.WorkingDirectory = '{EscapePowerShellSingleQuoted(Path.GetDirectoryName(installedExe)!)}'
+$shortcut.Description = 'Switcher'
+$shortcut.Save()
+Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+""";
+        File.WriteAllText(scriptPath, script, Encoding.UTF8);
+        StartHidden("powershell.exe", $"-NoProfile -ExecutionPolicy Bypass -File \"{scriptPath}\"");
+    }
+
+    private static void DeleteStartMenuShortcut()
+    {
+        var shortcutPath = GetStartMenuShortcutPath();
+        if (File.Exists(shortcutPath))
+        {
+            File.Delete(shortcutPath);
+        }
+    }
+
+    private static string GetStartMenuShortcutPath()
+    {
+        return Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.StartMenu),
+            "Programs",
+            "Switcher.lnk");
+    }
+
+    private static string EscapePowerShellSingleQuoted(string value)
+    {
+        return value.Replace("'", "''");
+    }
+
+    private static void StartHidden(string fileName, string arguments)
+    {
+        Process.Start(new ProcessStartInfo
+        {
+            FileName = fileName,
+            Arguments = arguments,
+            CreateNoWindow = true,
+            WindowStyle = ProcessWindowStyle.Hidden,
+            UseShellExecute = false,
+        });
+    }
+
+    private static bool SamePath(string left, string right)
+    {
+        return string.Equals(
+            Path.GetFullPath(left).TrimEnd(Path.DirectorySeparatorChar),
+            Path.GetFullPath(right).TrimEnd(Path.DirectorySeparatorChar),
+            StringComparison.OrdinalIgnoreCase);
+    }
+}
+
+internal sealed record UpdateInfo(
+    string TagName,
+    Version Version,
+    string PageUrl,
+    string DownloadUrl,
+    long Size,
+    bool IsNewer);
+
+internal static class UpdateManager
+{
+    public static async Task<UpdateInfo> CheckLatestAsync(CancellationToken cancellationToken = default)
+    {
+        using var client = CreateClient();
+        using var response = await client.GetAsync(ApplicationInfo.LatestReleaseApiUrl, cancellationToken);
+        response.EnsureSuccessStatusCode();
+        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+        using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
+        var root = document.RootElement;
+        var tagName = root.GetProperty("tag_name").GetString() ?? "v0.0.0";
+        var pageUrl = root.TryGetProperty("html_url", out var htmlUrl)
+            ? htmlUrl.GetString() ?? ApplicationInfo.ReleasesUrl
+            : ApplicationInfo.ReleasesUrl;
+
+        var versionText = tagName.TrimStart('v', 'V');
+        if (!Version.TryParse(versionText, out var latestVersion))
+        {
+            latestVersion = new Version(0, 0, 0);
+        }
+
+        var asset = root
+            .GetProperty("assets")
+            .EnumerateArray()
+            .FirstOrDefault(item => string.Equals(item.GetProperty("name").GetString(), "Switcher.exe", StringComparison.OrdinalIgnoreCase));
+
+        if (asset.ValueKind == JsonValueKind.Undefined)
+        {
+            throw new InvalidOperationException("В последнем релизе не найден Switcher.exe.");
+        }
+
+        var downloadUrl = asset.GetProperty("browser_download_url").GetString()
+            ?? throw new InvalidOperationException("В релизе нет ссылки на скачивание Switcher.exe.");
+        var size = asset.TryGetProperty("size", out var sizeElement) ? sizeElement.GetInt64() : 0;
+
+        return new UpdateInfo(
+            tagName,
+            latestVersion,
+            pageUrl,
+            downloadUrl,
+            size,
+            latestVersion > ApplicationInfo.CurrentVersion);
+    }
+
+    public static async Task<string> DownloadUpdateAsync(UpdateInfo update, CancellationToken cancellationToken = default)
+    {
+        var tempPath = Path.Combine(Path.GetTempPath(), $"Switcher.{update.TagName}.exe");
+        using var client = CreateClient();
+        using var response = await client.GetAsync(update.DownloadUrl, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        response.EnsureSuccessStatusCode();
+        await using var source = await response.Content.ReadAsStreamAsync(cancellationToken);
+        await using var target = File.Create(tempPath);
+        await source.CopyToAsync(target, cancellationToken);
+        return tempPath;
+    }
+
+    private static System.Net.Http.HttpClient CreateClient()
+    {
+        var client = new System.Net.Http.HttpClient();
+        client.DefaultRequestHeaders.UserAgent.ParseAdd($"Switcher/{ApplicationInfo.CurrentVersionText}");
+        client.DefaultRequestHeaders.Accept.ParseAdd("application/vnd.github+json");
+        return client;
     }
 }
 
