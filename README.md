@@ -1,19 +1,31 @@
 # Switcher
 
-Windows tray utility for automatic RU/EN keyboard layout correction.
+Небольшая Windows-утилита в трее для автоматического исправления слов, набранных в неправильной русской или английской раскладке.
 
-Switcher watches the last typed word, detects common wrong-layout input such as
-`ghbdtn -> привет`, switches the active keyboard layout, replaces the typed text,
-and plays a system sound. It also supports manual conversion and undo hotkeys.
+Switcher следит за последним набранным словом, распознает частые ошибки раскладки вроде `ghbdtn -> привет`, переключает активную раскладку, заменяет текст и проигрывает системный звук. Также есть ручная конвертация и откат последнего автоисправления.
 
-Tray-приложение для Windows, которое автоматически исправляет слова, набранные в неверной RU/EN раскладке, переключает раскладку и проигрывает системный звук.
+## Возможности
+
+- Автоисправление слов после пробела или знака препинания.
+- Смена раскладки на нужную после исправления.
+- Звук при автоматической и ручной смене.
+- Откат последней автоматической замены.
+- Ручная конвертация текущего или последнего слова.
+- Иконка в трее и простые настройки.
+- Включение автозапуска вместе с Windows.
 
 ## Управление
 
 - `Ctrl+Alt+Space` - конвертировать текущее слово или последнее слово перед курсором.
 - `Ctrl+Alt+Backspace` - откатить последнее автоматическое исправление.
 - Двойной клик по иконке в трее - открыть настройки.
-- В меню трея можно включить или выключить автопереключение, звук и автозагрузку.
+- Меню трея - включить или выключить автопереключение, звук и автозагрузку.
+
+## Скачать
+
+Готовая сборка находится в разделе релизов:
+
+[Скачать Switcher.exe](https://github.com/yavasilek/Switcher/releases/latest)
 
 ## Сборка
 
@@ -28,14 +40,14 @@ dotnet publish -c Release -r win-x64 -o .\publish\win-x64 -p:PublishSingleFile=t
 publish\win-x64\Switcher.exe
 ```
 
-## GitHub Releases
+## Автоматическая сборка на GitHub
 
-The repository includes GitHub Actions:
+В репозитории настроены GitHub Actions:
 
-- `.github/workflows/build.yml` builds and uploads `Switcher.exe` as an artifact on pushes and pull requests.
-- `.github/workflows/release.yml` builds a single-file Windows x64 exe and attaches it to a GitHub Release when a tag like `v0.1.0` is pushed.
+- `.github/workflows/build.yml` собирает проект и загружает `Switcher.exe` как артефакт при push и pull request.
+- `.github/workflows/release.yml` собирает один Windows x64 exe-файл и прикрепляет его к GitHub Release при отправке тега вида `v0.1.0`.
 
-Release locally:
+Создать новый релиз локально:
 
 ```powershell
 git tag v0.1.0
@@ -48,12 +60,12 @@ git push origin main --tags
 Start-Process .\publish\win-x64\Switcher.exe -ArgumentList '--self-test' -Wait -PassThru -WindowStyle Hidden
 ```
 
-Self-test проверяет базовые пары вроде `ghbdtn -> привет`, `руддщ -> hello`, `ntcn -> тест`.
+Self-test проверяет базовые пары вроде `ghbdtn -> привет`, `руддщ -> hello`, `ntcn -> тест`, `ьн -> my`, `рш -> hi`.
 
 ## Идеи следующего этапа
 
-- Черный список приложений и режим паузы для password manager, терминалов и игр.
+- Черный список приложений и режим паузы для менеджеров паролей, терминалов и игр.
 - Редактируемые пользовательские словари.
 - История последних исправлений в окне настроек.
-- Отдельные звуки для направления `EN -> RU` и `RU -> EN`.
+- Отдельные звуки для направлений `EN -> RU` и `RU -> EN`.
 - Конвертация выделенного текста через безопасный clipboard-режим с восстановлением буфера.

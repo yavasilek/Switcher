@@ -1,4 +1,4 @@
-name: Release
+name: Релиз
 
 on:
   push:
@@ -10,22 +10,22 @@ permissions:
 
 jobs:
   release:
-    name: Publish Windows x64 release
+    name: Опубликовать релиз Windows x64
     runs-on: windows-latest
 
     steps:
-      - name: Checkout
+      - name: Получить код
         uses: actions/checkout@v4
 
-      - name: Setup .NET
+      - name: Установить .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 10.0.x
 
-      - name: Restore
+      - name: Восстановить зависимости
         run: dotnet restore
 
-      - name: Publish single-file exe
+      - name: Опубликовать один exe-файл
         run: >
           dotnet publish -c Release -r win-x64 -o .\publish\win-x64
           -p:PublishSingleFile=true
@@ -34,7 +34,7 @@ jobs:
           -p:DebugType=None
           -p:DebugSymbols=false
 
-      - name: Self-test
+      - name: Самопроверка
         shell: pwsh
         run: |
           $exe = Join-Path $PWD 'publish\win-x64\Switcher.exe'
@@ -43,14 +43,14 @@ jobs:
             exit $p.ExitCode
           }
 
-      - name: Create checksum
+      - name: Создать SHA256
         shell: pwsh
         run: |
           $exe = Join-Path $PWD 'publish\win-x64\Switcher.exe'
           $hash = Get-FileHash -Algorithm SHA256 $exe
           "$($hash.Hash.ToLowerInvariant())  Switcher.exe" | Set-Content -Encoding ascii .\publish\win-x64\Switcher.exe.sha256
 
-      - name: Create GitHub release
+      - name: Создать GitHub Release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -60,4 +60,4 @@ jobs:
             ".\publish\win-x64\Switcher.exe#Switcher-win-x64.exe" `
             ".\publish\win-x64\Switcher.exe.sha256#Switcher-win-x64.exe.sha256" `
             --title $tag `
-            --notes "Windows x64 single-file build of Switcher."
+            --notes "Готовая single-file сборка Switcher для Windows x64."
