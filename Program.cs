@@ -56,6 +56,34 @@ internal static class Program
         }
 
         ApplicationConfiguration.Initialize();
+        if (!args.Contains("--portable", StringComparer.OrdinalIgnoreCase)
+            && !args.Contains("--updated", StringComparer.OrdinalIgnoreCase)
+            && InstallManager.ShouldPromptForPortableLaunch)
+        {
+            var choice = MessageBox.Show(
+                "Switcher запущен как portable-версия.\r\n\r\nДа - установить в систему и запустить установленную копию.\r\nНет - продолжить portable-запуск.\r\nОтмена - закрыть.",
+                "Switcher",
+                MessageBoxButtons.YesNoCancel,
+                MessageBoxIcon.Question);
+
+            if (choice == DialogResult.Cancel)
+            {
+                return;
+            }
+
+            if (choice == DialogResult.Yes)
+            {
+                var installedPath = InstallManager.InstallCurrentExecutable();
+                mutex.ReleaseMutex();
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = installedPath,
+                    UseShellExecute = true,
+                });
+                return;
+            }
+        }
+
         Application.Run(new SwitcherApplicationContext());
     }
 }
@@ -147,6 +175,9 @@ internal static class SelfTest
 
 internal sealed class SwitcherApplicationContext : ApplicationContext
 {
+    private static readonly TimeSpan BackgroundUpdateDelay = TimeSpan.FromSeconds(8);
+    private static readonly TimeSpan UpdateCheckInterval = TimeSpan.FromHours(12);
+
     private readonly Control _uiThread = new();
     private readonly NotifyIcon _notifyIcon;
     private readonly KeyboardHook _keyboardHook;
@@ -154,6 +185,7 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
     private SettingsForm? _settingsForm;
     private LastTypedSegment? _lastTypedSegment;
     private LastCorrection? _lastCorrection;
+    private UpdateInfo? _availableUpdate;
     private AppSettings _settings;
 
     public SwitcherApplicationContext()
@@ -172,6 +204,7 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         _notifyIcon.DoubleClick += (_, _) => ShowSettings();
 
         _keyboardHook = new KeyboardHook(HandleKeyDown);
+        _ = CheckForUpdatesInBackgroundAsync();
     }
 
     public AppSettings Settings => _settings;
@@ -197,6 +230,8 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
     }
 
     public IReadOnlyList<CorrectionHistoryItem> History => _settings.History;
+
+    public UpdateInfo? AvailableUpdate => _availableUpdate;
 
     public string InstallationStatus
     {
@@ -272,12 +307,21 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         };
         var checkUpdatesItem = new ToolStripMenuItem("Проверить обновления", null, async (_, _) =>
         {
-            var update = await CheckForUpdatesAsync();
-            if (update?.IsNewer == true)
+            if (_availableUpdate?.IsNewer == true)
             {
-                await InstallUpdateAsync(update);
+                await InstallUpdateAsync(_availableUpdate);
+                return;
             }
-        });
+
+            var checkedUpdate = await CheckForUpdatesAsync(showResult: true);
+            if (checkedUpdate?.IsNewer == true)
+            {
+                await InstallUpdateAsync(checkedUpdate);
+            }
+        })
+        {
+            Name = "CheckUpdates",
+        };
         var convertItem = new ToolStripMenuItem("Конвертировать последнее слово: Ctrl+Alt+Space");
         convertItem.Enabled = false;
         var convertSelectionItem = new ToolStripMenuItem("Конвертировать выделенный текст: Ctrl+Alt+Enter");
@@ -350,6 +394,13 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         {
             installItem.Enabled = !InstallManager.IsCurrentInstanceInstalled;
             installItem.Text = InstallManager.IsCurrentInstanceInstalled ? "Уже установлено в систему" : "Установить в систему";
+        }
+
+        if (menu.Items["CheckUpdates"] is ToolStripMenuItem checkUpdatesItem)
+        {
+            checkUpdatesItem.Text = _availableUpdate?.IsNewer == true
+                ? $"Установить обновление {_availableUpdate.TagName}"
+                : "Проверить обновления";
         }
     }
 
@@ -643,11 +694,7 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
 
                 if (result == DialogResult.Yes)
                 {
-                    Process.Start(new ProcessStartInfo
-                    {
-                        FileName = installedPath,
-                        UseShellExecute = true,
-                    });
+                    InstallManager.ScheduleStartAfterExit(installedPath, Environment.ProcessId);
                     ExitThread();
                 }
             }
@@ -702,20 +749,31 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         }
     }
 
-    public async Task<UpdateInfo?> CheckForUpdatesAsync()
+    public async Task<UpdateInfo?> CheckForUpdatesAsync(bool showResult)
     {
         try
         {
             var update = await UpdateManager.CheckLatestAsync();
-            var message = update.IsNewer
-                ? $"Доступна новая версия {update.TagName}.\r\nТекущая версия: v{ApplicationInfo.CurrentVersionText}"
-                : $"Установлена актуальная версия v{ApplicationInfo.CurrentVersionText}.";
-            MessageBox.Show(message, "Switcher", MessageBoxButtons.OK, update.IsNewer ? MessageBoxIcon.Information : MessageBoxIcon.None);
+            StoreUpdateCheckResult(update);
+            if (showResult)
+            {
+                var message = update.IsNewer
+                    ? $"Доступна новая версия {update.TagName}.\r\nТекущая версия: v{ApplicationInfo.CurrentVersionText}"
+                    : $"Установлена актуальная версия v{ApplicationInfo.CurrentVersionText}.";
+                MessageBox.Show(message, "Switcher", MessageBoxButtons.OK, update.IsNewer ? MessageBoxIcon.Information : MessageBoxIcon.None);
+            }
+
             return update;
         }
         catch (Exception ex)
         {
-            MessageBox.Show($"Не удалось проверить обновления:\r\n{ex.Message}", "Switcher", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            _settings.LastUpdateCheckUtc = DateTime.UtcNow;
+            SettingsStore.Save(_settings);
+            if (showResult)
+            {
+                MessageBox.Show($"Не удалось проверить обновления:\r\n{ex.Message}", "Switcher", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+
             return null;
         }
     }
@@ -742,6 +800,58 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         {
             MessageBox.Show($"Не удалось установить обновление:\r\n{ex.Message}", "Switcher", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
+    }
+
+    private async Task CheckForUpdatesInBackgroundAsync()
+    {
+        if (!_settings.AutoCheckUpdates)
+        {
+            return;
+        }
+
+        if (_settings.LastUpdateCheckUtc is { } lastCheck
+            && DateTime.UtcNow - lastCheck.ToUniversalTime() < UpdateCheckInterval)
+        {
+            return;
+        }
+
+        try
+        {
+            await Task.Delay(BackgroundUpdateDelay);
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(6));
+            var update = await UpdateManager.CheckLatestAsync(timeout.Token);
+            StoreUpdateCheckResult(update);
+            if (update.IsNewer)
+            {
+                PostToUi(() =>
+                {
+                    _notifyIcon.ShowBalloonTip(
+                        10000,
+                        "Доступно обновление Switcher",
+                        $"{update.TagName} готова к установке. Открой меню трея.",
+                        ToolTipIcon.Info);
+                    RefreshMenu();
+                    _settingsForm?.RefreshFromSettings();
+                });
+            }
+        }
+        catch
+        {
+            _settings.LastUpdateCheckUtc = DateTime.UtcNow;
+            SettingsStore.Save(_settings);
+        }
+    }
+
+    private void StoreUpdateCheckResult(UpdateInfo update)
+    {
+        _availableUpdate = update.IsNewer ? update : null;
+        _settings.LastUpdateCheckUtc = DateTime.UtcNow;
+        SettingsStore.Save(_settings);
+        PostToUi(() =>
+        {
+            RefreshMenu();
+            _settingsForm?.RefreshFromSettings();
+        });
     }
 
     private void PostToUi(Action action)
@@ -834,6 +944,7 @@ internal sealed class SettingsForm : Form
     private readonly CheckBox _sound = new();
     private readonly CheckBox _paused = new();
     private readonly CheckBox _startup = new();
+    private readonly CheckBox _autoCheckUpdates = new();
     private readonly ComboBox _enToRuSound = new();
     private readonly ComboBox _ruToEnSound = new();
     private readonly TextBox _excludedProcesses = new();
@@ -920,6 +1031,7 @@ internal sealed class SettingsForm : Form
         _sound.Checked = _context.Settings.Sound;
         _paused.Checked = _context.Settings.Paused;
         _startup.Checked = StartupManager.IsEnabledForPath(InstallManager.PreferredStartupPath);
+        _autoCheckUpdates.Checked = _context.Settings.AutoCheckUpdates;
         SetComboValue(_enToRuSound, _context.Settings.EnToRuSound);
         SetComboValue(_ruToEnSound, _context.Settings.RuToEnSound);
         _excludedProcesses.Text = LinesFrom(_context.Settings.ExcludedProcesses);
@@ -1119,13 +1231,14 @@ internal sealed class SettingsForm : Form
         {
             Dock = DockStyle.Fill,
             Padding = new Padding(14),
-            RowCount = 8,
+            RowCount = 9,
             ColumnCount = 1,
         };
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 70));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 24));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 54));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 54));
@@ -1161,9 +1274,12 @@ internal sealed class SettingsForm : Form
             Font = new Font("Segoe UI Semibold", 10F),
         }, 0, 3);
 
+        ConfigureCheckBox(_autoCheckUpdates, "Проверять новые версии автоматически в фоне");
+        layout.Controls.Add(_autoCheckUpdates, 0, 4);
+
         _updateStatus.Dock = DockStyle.Fill;
         _updateStatus.ForeColor = Color.FromArgb(51, 65, 85);
-        layout.Controls.Add(_updateStatus, 0, 4);
+        layout.Controls.Add(_updateStatus, 0, 5);
 
         var updateButtons = new FlowLayoutPanel
         {
@@ -1175,14 +1291,14 @@ internal sealed class SettingsForm : Form
         _installUpdateButton.Enabled = false;
         updateButtons.Controls.Add(_checkUpdateButton);
         updateButtons.Controls.Add(_installUpdateButton);
-        layout.Controls.Add(updateButtons, 0, 5);
+        layout.Controls.Add(updateButtons, 0, 6);
 
         layout.Controls.Add(new Label
         {
             Text = "Установка выполняется без прав администратора в профиль пользователя. Обновление скачивает последний Switcher.exe из GitHub Releases и заменяет текущий файл после закрытия приложения.",
             Dock = DockStyle.Fill,
             ForeColor = Color.FromArgb(71, 85, 105),
-        }, 0, 6);
+        }, 0, 7);
 
         return page;
     }
@@ -1219,6 +1335,13 @@ internal sealed class SettingsForm : Form
 
             StartupManager.SetEnabled(_startup.Checked, InstallManager.PreferredStartupPath);
             _context.UpdateSettings(s => s.StartWithWindows = _startup.Checked);
+        };
+        _autoCheckUpdates.CheckedChanged += (_, _) =>
+        {
+            if (!_updating)
+            {
+                _context.UpdateSettings(s => s.AutoCheckUpdates = _autoCheckUpdates.Checked);
+            }
         };
         _enToRuSound.SelectedIndexChanged += (_, _) =>
         {
@@ -1268,15 +1391,30 @@ internal sealed class SettingsForm : Form
 
     private void RefreshInstallState()
     {
+        if (_context.AvailableUpdate?.IsNewer == true)
+        {
+            _latestUpdate = _context.AvailableUpdate;
+        }
+
         _installStatus.Text = _context.InstallationStatus;
         _installButton.Enabled = !InstallManager.IsCurrentInstanceInstalled;
         _uninstallButton.Enabled = InstallManager.IsInstalled;
-        _updateStatus.Text = _latestUpdate is null
-            ? "Обновления ещё не проверялись."
-            : _latestUpdate.IsNewer
+        _updateStatus.Text = BuildUpdateStatusText();
+        _installUpdateButton.Enabled = _latestUpdate?.IsNewer == true;
+    }
+
+    private string BuildUpdateStatusText()
+    {
+        if (_latestUpdate is not null)
+        {
+            return _latestUpdate.IsNewer
                 ? $"Доступна версия {_latestUpdate.TagName}."
                 : $"Установлена актуальная версия v{ApplicationInfo.CurrentVersionText}.";
-        _installUpdateButton.Enabled = _latestUpdate?.IsNewer == true;
+        }
+
+        return _context.Settings.LastUpdateCheckUtc is { } lastCheck
+            ? $"Последняя фоновая проверка: {lastCheck.ToLocalTime():dd.MM.yyyy HH:mm}. Новых версий не найдено."
+            : "Обновления ещё не проверялись.";
     }
 
     private async Task CheckUpdatesFromFormAsync()
@@ -1286,7 +1424,7 @@ internal sealed class SettingsForm : Form
         _updateStatus.Text = "Проверяю GitHub Releases...";
         try
         {
-            _latestUpdate = await _context.CheckForUpdatesAsync();
+            _latestUpdate = await _context.CheckForUpdatesAsync(showResult: true);
         }
         finally
         {
@@ -1437,6 +1575,8 @@ internal sealed record AppSettings
     public bool Paused { get; set; }
     public bool Sound { get; set; } = true;
     public bool StartWithWindows { get; set; }
+    public bool AutoCheckUpdates { get; set; } = true;
+    public DateTime? LastUpdateCheckUtc { get; set; }
     public string EnToRuSound { get; set; } = SoundPlayerNames.Asterisk;
     public string RuToEnSound { get; set; } = SoundPlayerNames.Question;
     public List<string> ExcludedProcesses { get; set; } =
@@ -1652,6 +1792,8 @@ internal static class InstallManager
 
     public static bool IsInstalled => File.Exists(InstalledExePath);
 
+    public static bool ShouldPromptForPortableLaunch => !IsCurrentInstanceInstalled;
+
     public static string InstallCurrentExecutable()
     {
         Directory.CreateDirectory(InstallDirectory);
@@ -1699,6 +1841,25 @@ if not errorlevel 1 (
 copy /Y "{sourceExe}" "{targetExe}" >NUL
 del /F /Q "{sourceExe}" >NUL 2>NUL
 start "" "{targetExe}" --updated
+del "%~f0" >NUL 2>NUL
+""";
+        File.WriteAllText(scriptPath, script, Encoding.ASCII);
+        StartHidden("cmd.exe", $"/c \"{scriptPath}\"");
+    }
+
+    public static void ScheduleStartAfterExit(string executablePath, int processId)
+    {
+        var scriptPath = Path.Combine(Path.GetTempPath(), $"Switcher.Start.{Guid.NewGuid():N}.cmd");
+        var script = $"""
+@echo off
+setlocal
+:wait
+tasklist /FI "PID eq {processId}" 2>NUL | find "{processId}" >NUL
+if not errorlevel 1 (
+  timeout /t 1 /nobreak >NUL
+  goto wait
+)
+start "" "{executablePath}"
 del "%~f0" >NUL 2>NUL
 """;
         File.WriteAllText(scriptPath, script, Encoding.ASCII);
@@ -1797,7 +1958,7 @@ internal static class UpdateManager
 {
     public static async Task<UpdateInfo> CheckLatestAsync(CancellationToken cancellationToken = default)
     {
-        using var client = CreateClient();
+        using var client = CreateClient(TimeSpan.FromSeconds(6));
         using var response = await client.GetAsync(ApplicationInfo.LatestReleaseApiUrl, cancellationToken);
         response.EnsureSuccessStatusCode();
         await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
@@ -1840,7 +2001,7 @@ internal static class UpdateManager
     public static async Task<string> DownloadUpdateAsync(UpdateInfo update, CancellationToken cancellationToken = default)
     {
         var tempPath = Path.Combine(Path.GetTempPath(), $"Switcher.{update.TagName}.exe");
-        using var client = CreateClient();
+        using var client = CreateClient(TimeSpan.FromMinutes(10));
         using var response = await client.GetAsync(update.DownloadUrl, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
         response.EnsureSuccessStatusCode();
         await using var source = await response.Content.ReadAsStreamAsync(cancellationToken);
@@ -1849,9 +2010,12 @@ internal static class UpdateManager
         return tempPath;
     }
 
-    private static System.Net.Http.HttpClient CreateClient()
+    private static System.Net.Http.HttpClient CreateClient(TimeSpan timeout)
     {
-        var client = new System.Net.Http.HttpClient();
+        var client = new System.Net.Http.HttpClient
+        {
+            Timeout = timeout,
+        };
         client.DefaultRequestHeaders.UserAgent.ParseAdd($"Switcher/{ApplicationInfo.CurrentVersionText}");
         client.DefaultRequestHeaders.Accept.ParseAdd("application/vnd.github+json");
         return client;
