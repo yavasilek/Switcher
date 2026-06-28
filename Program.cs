@@ -56,6 +56,7 @@ internal static class SelfTest
         CheckAuto(failures, "руддщ", "hello");
         CheckAuto(failures, "ntcn", "тест");
         CheckAuto(failures, "ьн", "my");
+        CheckAuto(failures, "рш", "hi");
         CheckManual(failures, "vtyz", "меня");
         CheckManual(failures, "сщву", "code");
         CheckNoAuto(failures, "test");
@@ -889,7 +890,7 @@ internal static class TextHeuristics
         "phone", "number", "city", "time", "day", "night", "morning", "evening", "good",
         "bad", "important", "urgent", "check", "solution", "problem", "version", "release",
         "commit", "branch", "repository", "user", "name", "value", "key", "token", "api",
-        "my", "me", "we", "us", "it", "is", "am", "in", "on", "of", "to", "as", "at",
+        "my", "me", "we", "us", "it", "is", "am", "hi", "in", "on", "of", "to", "as", "at",
         "if", "do", "go", "he", "she", "you", "not", "and", "but", "can", "may",
         "github", "windows", "keyboard", "shortcut", "hotkey", "design",
     };
