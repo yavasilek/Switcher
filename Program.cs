@@ -59,6 +59,7 @@ internal static class SelfTest
         CheckManual(failures, "сщву", "code");
         CheckNoAuto(failures, "test");
         CheckNoAuto(failures, "code");
+        CheckInputSize(failures);
 
         if (failures.Count == 0)
         {
@@ -91,6 +92,16 @@ internal static class SelfTest
         if (TextHeuristics.TryAutoCorrect(input, out var correction))
         {
             failures.Add($"NOAUTO {input}: unexpected {correction.Text}");
+        }
+    }
+
+    private static void CheckInputSize(List<string> failures)
+    {
+        var actual = Marshal.SizeOf<NativeMethods.Input>();
+        var expected = Environment.Is64BitProcess ? 40 : 28;
+        if (actual != expected)
+        {
+            failures.Add($"INPUT size: expected {expected}, actual {actual}");
         }
     }
 }
@@ -340,8 +351,12 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         var correctedText = correction.Text + delimiter;
 
         NativeMethods.SwitchForegroundLayout(correction.TargetLayout);
-        InputSender.Backspace(originalWord.Length);
-        InputSender.TypeText(correctedText);
+        if (!InputSender.ReplaceText(originalWord.Length, correctedText))
+        {
+            PlayErrorSound();
+            UpdateBalloon("Ошибка ввода", "Windows заблокировала замену текста");
+            return;
+        }
 
         _lastCorrection = new LastCorrection(originalText, correctedText, correction.SourceLayout, correction.TargetLayout);
         _lastTypedSegment = null;
@@ -362,8 +377,13 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
             }
 
             NativeMethods.SwitchForegroundLayout(correction.TargetLayout);
-            InputSender.Backspace(word.Length);
-            InputSender.TypeText(correction.Text);
+            if (!InputSender.ReplaceText(word.Length, correction.Text))
+            {
+                PlayErrorSound();
+                UpdateBalloon("Ошибка ввода", "Windows заблокировала замену текста");
+                return;
+            }
+
             _currentWord.Clear();
             _currentWord.Append(correction.Text);
             _lastCorrection = null;
@@ -387,8 +407,13 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         }
 
         NativeMethods.SwitchForegroundLayout(segmentCorrection.TargetLayout);
-        InputSender.Backspace(segment.Word.Length + segment.Delimiter.Length);
-        InputSender.TypeText(segmentCorrection.Text + segment.Delimiter);
+        if (!InputSender.ReplaceText(segment.Word.Length + segment.Delimiter.Length, segmentCorrection.Text + segment.Delimiter))
+        {
+            PlayErrorSound();
+            UpdateBalloon("Ошибка ввода", "Windows заблокировала замену текста");
+            return;
+        }
+
         _lastCorrection = null;
         _lastTypedSegment = null;
         PlaySwitchSound(segmentCorrection.Direction);
@@ -405,8 +430,13 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
 
         var correction = _lastCorrection;
         NativeMethods.SwitchForegroundLayout(correction.SourceLayout);
-        InputSender.Backspace(correction.CorrectedText.Length);
-        InputSender.TypeText(correction.OriginalText);
+        if (!InputSender.ReplaceText(correction.CorrectedText.Length, correction.OriginalText))
+        {
+            PlayErrorSound();
+            UpdateBalloon("Ошибка ввода", "Windows заблокировала замену текста");
+            return;
+        }
+
         _lastCorrection = null;
         _lastTypedSegment = null;
         _currentWord.Clear();
@@ -1152,39 +1182,27 @@ internal static class InputSender
     private const uint KeyeventfKeyup = 0x0002;
     private const uint KeyeventfUnicode = 0x0004;
 
-    public static void Backspace(int count)
+    public static bool ReplaceText(int backspaceCount, string text)
     {
-        if (count <= 0)
+        if (backspaceCount <= 0 && string.IsNullOrEmpty(text))
         {
-            return;
+            return true;
         }
 
-        var inputs = new NativeMethods.Input[count * 2];
-        for (var i = 0; i < count; i++)
+        var inputs = new List<NativeMethods.Input>((backspaceCount * 2) + (text.Length * 2));
+        for (var i = 0; i < backspaceCount; i++)
         {
-            var offset = i * 2;
-            inputs[offset] = KeyboardInput((ushort)Keys.Back, 0, 0);
-            inputs[offset + 1] = KeyboardInput((ushort)Keys.Back, 0, KeyeventfKeyup);
+            inputs.Add(KeyboardInput((ushort)Keys.Back, 0, 0));
+            inputs.Add(KeyboardInput((ushort)Keys.Back, 0, KeyeventfKeyup));
         }
 
-        NativeMethods.SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<NativeMethods.Input>());
-    }
-
-    public static void TypeText(string text)
-    {
-        if (string.IsNullOrEmpty(text))
-        {
-            return;
-        }
-
-        var inputs = new List<NativeMethods.Input>(text.Length * 2);
         foreach (var ch in text)
         {
             inputs.Add(KeyboardInput(0, ch, KeyeventfUnicode));
             inputs.Add(KeyboardInput(0, ch, KeyeventfUnicode | KeyeventfKeyup));
         }
 
-        NativeMethods.SendInput((uint)inputs.Count, inputs.ToArray(), Marshal.SizeOf<NativeMethods.Input>());
+        return NativeMethods.SendKeyboardInput(inputs.ToArray());
     }
 
     private static NativeMethods.Input KeyboardInput(ushort virtualKey, ushort scanCode, uint flags)
@@ -1238,6 +1256,12 @@ internal static class NativeMethods
     {
         [FieldOffset(0)]
         public Keybdinput Ki;
+
+        [FieldOffset(0)]
+        public Mouseinput Mi;
+
+        [FieldOffset(0)]
+        public Hardwareinput Hi;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -1248,6 +1272,36 @@ internal static class NativeMethods
         public uint DwFlags;
         public uint Time;
         public UIntPtr DwExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct Mouseinput
+    {
+        public int Dx;
+        public int Dy;
+        public uint MouseData;
+        public uint DwFlags;
+        public uint Time;
+        public UIntPtr DwExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct Hardwareinput
+    {
+        public uint UMsg;
+        public ushort WParamL;
+        public ushort WParamH;
+    }
+
+    public static bool SendKeyboardInput(Input[] inputs)
+    {
+        if (inputs.Length == 0)
+        {
+            return true;
+        }
+
+        var sent = SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<Input>());
+        return sent == inputs.Length;
     }
 
     public static string TryTranslateKey(int vkCode, int scanCode)
