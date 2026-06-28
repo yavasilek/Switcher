@@ -55,6 +55,7 @@ internal static class SelfTest
         CheckAuto(failures, "ghbdtn", "привет");
         CheckAuto(failures, "руддщ", "hello");
         CheckAuto(failures, "ntcn", "тест");
+        CheckAuto(failures, "ьн", "my");
         CheckManual(failures, "vtyz", "меня");
         CheckManual(failures, "сщву", "code");
         CheckNoAuto(failures, "test");
@@ -888,6 +889,8 @@ internal static class TextHeuristics
         "phone", "number", "city", "time", "day", "night", "morning", "evening", "good",
         "bad", "important", "urgent", "check", "solution", "problem", "version", "release",
         "commit", "branch", "repository", "user", "name", "value", "key", "token", "api",
+        "my", "me", "we", "us", "it", "is", "am", "in", "on", "of", "to", "as", "at",
+        "if", "do", "go", "he", "she", "you", "not", "and", "but", "can", "may",
         "github", "windows", "keyboard", "shortcut", "hotkey", "design",
     };
 
@@ -906,7 +909,7 @@ internal static class TextHeuristics
     public static bool TryAutoCorrect(string word, out CorrectionResult correction)
     {
         correction = default!;
-        if (word.Length < 4 || !TryConvertAny(word, out var converted))
+        if (word.Length < 2 || !TryConvertAny(word, out var converted))
         {
             return false;
         }
@@ -929,6 +932,11 @@ internal static class TextHeuristics
         var targetIsKnownWord = converted.Direction == LayoutDirection.LatinToCyrillic
             ? RussianWords.Contains(converted.Text.ToLowerInvariant())
             : EnglishWords.Contains(converted.Text.ToLowerInvariant());
+
+        if (word.Length < 4 && !targetIsKnownWord)
+        {
+            return false;
+        }
 
         if (targetIsKnownWord && targetScore - sourceScore >= 8)
         {
