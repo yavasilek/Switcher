@@ -107,6 +107,7 @@ internal static class SelfTest
         CheckManual(failures, "сщву", "code");
         CheckNoAuto(failures, "test");
         CheckNoAuto(failures, "code");
+        CheckNeverCorrect(failures);
         CheckSettingsRoundTrip(failures);
         CheckInputSize(failures);
 
@@ -187,6 +188,19 @@ internal static class SelfTest
         }
     }
 
+    private static void CheckNeverCorrect(List<string> failures)
+    {
+        var settings = new AppSettings
+        {
+            CustomNeverCorrectWords = ["ghbdtn"],
+        };
+
+        if (TextHeuristics.TryAutoCorrect("ghbdtn", settings, out var correction))
+        {
+            failures.Add($"NEVER ghbdtn: unexpected {correction.Text}");
+        }
+    }
+
     private static void CheckSettingsRoundTrip(List<string> failures)
     {
         var path = Path.Combine(Path.GetTempPath(), $"Switcher.settings.{Guid.NewGuid():N}.json");
@@ -198,6 +212,10 @@ internal static class SelfTest
                 FirstRunHintShown = true,
                 CustomEnglishWords = ["codex"],
                 CustomRussianWords = ["пример"],
+                CustomNeverCorrectWords = ["steam"],
+                AggressiveShortWords = true,
+                ClipboardFallback = true,
+                AutoHealKeyboardHook = true,
                 LearnFromManualCorrections = true,
                 CustomAutoReplacements = [new AutoReplacementRule { Original = "ghbdtn", Corrected = "привет" }],
                 ConvertWordHotkey = new HotkeyBinding { Ctrl = true, Alt = false, Key = Keys.F8 },
@@ -213,6 +231,16 @@ internal static class SelfTest
             if (!loaded.CustomEnglishWords.Contains("codex") || !loaded.CustomRussianWords.Contains("пример"))
             {
                 failures.Add("SETTINGS roundtrip: custom dictionaries were not preserved");
+            }
+
+            if (!loaded.CustomNeverCorrectWords.Contains("steam"))
+            {
+                failures.Add("SETTINGS roundtrip: never-correct words were not preserved");
+            }
+
+            if (!loaded.AggressiveShortWords || !loaded.ClipboardFallback || !loaded.AutoHealKeyboardHook)
+            {
+                failures.Add("SETTINGS roundtrip: reliability toggles were not preserved");
             }
 
             if (!loaded.LearnFromManualCorrections || loaded.CustomAutoReplacements.Count != 1 || loaded.CustomAutoReplacements[0].Corrected != "привет")
@@ -257,11 +285,15 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
 {
     private static readonly TimeSpan BackgroundUpdateDelay = TimeSpan.FromSeconds(8);
     private static readonly TimeSpan UpdateCheckInterval = TimeSpan.FromHours(12);
+    private static readonly TimeSpan HookStaleAfter = TimeSpan.FromMinutes(20);
+    private static readonly TimeSpan HookRepairCooldown = TimeSpan.FromMinutes(10);
 
     private readonly Control _uiThread = new();
     private readonly NotifyIcon _notifyIcon;
     private readonly KeyboardHook _keyboardHook;
+    private readonly System.Windows.Forms.Timer _healthTimer = new();
     private readonly StringBuilder _currentWord = new();
+    private readonly DiagnosticState _diagnostics = new();
     private SettingsForm? _settingsForm;
     private LastTypedSegment? _lastTypedSegment;
     private LastCorrection? _lastCorrection;
@@ -284,6 +316,9 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         _notifyIcon.DoubleClick += (_, _) => ShowSettings();
 
         _keyboardHook = new KeyboardHook(HandleKeyDown);
+        _healthTimer.Interval = 60000;
+        _healthTimer.Tick += (_, _) => CheckHookHealth();
+        _healthTimer.Start();
         _ = CheckForUpdatesInBackgroundAsync();
         if (!_settings.FirstRunHintShown)
         {
@@ -316,6 +351,8 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
     public IReadOnlyList<CorrectionHistoryItem> History => _settings.History;
 
     public UpdateInfo? AvailableUpdate => _availableUpdate;
+
+    public string DiagnosticsText => BuildDiagnosticsText();
 
     public string InstallationStatus
     {
@@ -367,6 +404,8 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
     protected override void ExitThreadCore()
     {
         SettingsStore.Save(_settings);
+        _healthTimer.Stop();
+        _healthTimer.Dispose();
         _keyboardHook.Dispose();
         _notifyIcon.Visible = false;
         _notifyIcon.Dispose();
@@ -556,38 +595,55 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
 
     private bool HandleKeyDown(Keys key, int scanCode)
     {
+        _diagnostics.LastHookEventUtc = DateTime.UtcNow;
+        _diagnostics.LastKey = $"{key} / scan {scanCode}";
+        _diagnostics.CurrentWord = _currentWord.ToString();
+
         if (KeyboardState.Matches(_settings.PauseHotkey, key))
         {
+            SetDiagnosticDecision($"Горячая клавиша паузы: {key}");
             PostToUi(TogglePause);
             return true;
         }
 
-        if (_settings.Paused || IsForegroundProcessExcluded(out _))
+        if (_settings.Paused)
         {
+            SetDiagnosticDecision("Пропуск: включена пауза");
+            ResetTypingState();
+            return false;
+        }
+
+        if (IsForegroundProcessExcluded(out var excludedProcess))
+        {
+            SetDiagnosticDecision($"Пропуск: процесс в исключениях ({excludedProcess})");
             ResetTypingState();
             return false;
         }
 
         if (KeyboardState.Matches(_settings.UndoHotkey, key))
         {
+            SetDiagnosticDecision($"Горячая клавиша отката: {key}");
             PostToUi(UndoLastCorrection);
             return true;
         }
 
         if (KeyboardState.Matches(_settings.ConvertWordHotkey, key))
         {
+            SetDiagnosticDecision($"Горячая клавиша конвертации слова: {key}");
             PostToUi(ConvertRecentWordManually);
             return true;
         }
 
         if (KeyboardState.Matches(_settings.ConvertSelectionHotkey, key))
         {
+            SetDiagnosticDecision($"Горячая клавиша выделенного текста: {key}");
             PostToUi(ConvertSelectedTextManually);
             return true;
         }
 
         if (KeyboardState.HasCommandModifierDown())
         {
+            SetDiagnosticDecision("Пропуск: нажата командная клавиша");
             return false;
         }
 
@@ -604,6 +660,7 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
 
         if (KeyboardState.IsNavigationOrEditingKey(key))
         {
+            SetDiagnosticDecision($"Сброс слова: навигационная клавиша {key}");
             ResetTypingState();
             return false;
         }
@@ -611,12 +668,14 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         var text = NativeMethods.TryTranslateKey((int)key, scanCode);
         if (string.IsNullOrEmpty(text))
         {
+            SetDiagnosticDecision($"Пропуск: клавиша {key} не дала символ");
             return false;
         }
 
         var ch = text[0];
         if (char.IsControl(ch))
         {
+            SetDiagnosticDecision("Сброс слова: управляющий символ");
             ResetTypingState();
             return false;
         }
@@ -625,11 +684,14 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         {
             InvalidateRecentActions();
             _currentWord.Append(ch);
+            _diagnostics.CurrentWord = _currentWord.ToString();
+            SetDiagnosticDecision($"Набор слова: {_diagnostics.CurrentWord}");
             return false;
         }
 
         if (!TextHeuristics.IsDelimiter(ch))
         {
+            SetDiagnosticDecision($"Сброс слова: символ-разделитель не поддержан ({ch})");
             ResetTypingState();
             return false;
         }
@@ -637,11 +699,22 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         var word = _currentWord.ToString();
         _currentWord.Clear();
         var delimiter = ch.ToString();
+        _diagnostics.LastWord = word;
+        _diagnostics.CurrentWord = "";
 
-        if (_settings.AutoSwitch && TextHeuristics.TryAutoCorrect(word, _settings, out var correction))
+        if (!_settings.AutoSwitch)
         {
+            SetDiagnosticDecision($"Авто выключено, слово: {word}");
+        }
+        else if (TextHeuristics.TryAutoCorrect(word, _settings, out var correction, out var reason))
+        {
+            SetDiagnosticDecision($"Автозамена: {word} -> {correction.Text}. {reason}");
             PostToUi(() => ApplyCorrection(word, delimiter, correction));
             return true;
+        }
+        else
+        {
+            SetDiagnosticDecision($"Автозамены нет для '{word}': {reason}");
         }
 
         if (TextHeuristics.CanConvert(word))
@@ -662,8 +735,7 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         var originalText = originalWord + delimiter;
         var correctedText = correction.Text + delimiter;
 
-        NativeMethods.SwitchForegroundLayout(correction.TargetLayout);
-        if (!InputSender.ReplaceText(originalWord.Length, correctedText))
+        if (!SwitchLayoutAndReplace(correction.TargetLayout, originalWord.Length, correctedText, out var inputMethod))
         {
             PlayErrorSound();
             UpdateBalloon("Ошибка ввода", "Windows заблокировала замену текста");
@@ -675,7 +747,7 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
 
         AddHistory("Авто", originalText, correctedText);
         PlaySwitchSound(correction.Direction);
-        UpdateBalloon("Автозамена", $"{originalText} -> {correctedText}");
+        UpdateBalloon("Автозамена", $"{originalText} -> {correctedText} ({inputMethod})");
     }
 
     private void ConvertRecentWordManually()
@@ -689,8 +761,7 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
                 return;
             }
 
-            NativeMethods.SwitchForegroundLayout(correction.TargetLayout);
-            if (!InputSender.ReplaceText(word.Length, correction.Text))
+            if (!SwitchLayoutAndReplace(correction.TargetLayout, word.Length, correction.Text, out var inputMethod))
             {
                 PlayErrorSound();
                 UpdateBalloon("Ошибка ввода", "Windows заблокировала замену текста");
@@ -704,7 +775,7 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
             AddHistory("Ручная", word, correction.Text);
             MaybeLearnAutoReplacement(word, correction.Text);
             PlaySwitchSound(correction.Direction);
-            UpdateBalloon("Ручная конвертация", $"{word} -> {correction.Text}");
+            UpdateBalloon("Ручная конвертация", $"{word} -> {correction.Text} ({inputMethod})");
             return;
         }
 
@@ -721,8 +792,7 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
             return;
         }
 
-        NativeMethods.SwitchForegroundLayout(segmentCorrection.TargetLayout);
-        if (!InputSender.ReplaceText(segment.Word.Length + segment.Delimiter.Length, segmentCorrection.Text + segment.Delimiter))
+        if (!SwitchLayoutAndReplace(segmentCorrection.TargetLayout, segment.Word.Length + segment.Delimiter.Length, segmentCorrection.Text + segment.Delimiter, out var segmentInputMethod))
         {
             PlayErrorSound();
             UpdateBalloon("Ошибка ввода", "Windows заблокировала замену текста");
@@ -734,7 +804,7 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         AddHistory("Ручная", segment.Word + segment.Delimiter, segmentCorrection.Text + segment.Delimiter);
         MaybeLearnAutoReplacement(segment.Word, segmentCorrection.Text);
         PlaySwitchSound(segmentCorrection.Direction);
-        UpdateBalloon("Ручная конвертация", $"{segment.Word} -> {segmentCorrection.Text}");
+        UpdateBalloon("Ручная конвертация", $"{segment.Word} -> {segmentCorrection.Text} ({segmentInputMethod})");
     }
 
     private void ConvertSelectedTextManually()
@@ -760,7 +830,8 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
             return;
         }
 
-        NativeMethods.SwitchForegroundLayout(correction.TargetLayout);
+        var layoutSwitch = NativeMethods.SwitchForegroundLayout(correction.TargetLayout);
+        StoreLayoutSwitch(layoutSwitch);
         Clipboard.SetText(correction.Text, TextDataFormat.UnicodeText);
         InputSender.SendChord(Keys.ControlKey, Keys.V);
         Thread.Sleep(120);
@@ -781,8 +852,7 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         }
 
         var correction = _lastCorrection;
-        NativeMethods.SwitchForegroundLayout(correction.SourceLayout);
-        if (!InputSender.ReplaceText(correction.CorrectedText.Length, correction.OriginalText))
+        if (!SwitchLayoutAndReplace(correction.SourceLayout, correction.CorrectedText.Length, correction.OriginalText, out var inputMethod))
         {
             PlayErrorSound();
             UpdateBalloon("Ошибка ввода", "Windows заблокировала замену текста");
@@ -794,7 +864,7 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         _currentWord.Clear();
         AddHistory("Откат", correction.CorrectedText, correction.OriginalText);
         PlayErrorSound();
-        UpdateBalloon("Откат", correction.OriginalText.TrimEnd());
+        UpdateBalloon("Откат", $"{correction.OriginalText.TrimEnd()} ({inputMethod})");
     }
 
     public void ClearHistory()
@@ -811,6 +881,23 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
     {
         UpdateSettings(s => s.Paused = !s.Paused);
         UpdateBalloon("Пауза", _settings.Paused ? "включена" : "выключена");
+    }
+
+    public void ReinstallKeyboardHook()
+    {
+        try
+        {
+            _keyboardHook.Reinstall();
+            _diagnostics.HookReinstallCount++;
+            _diagnostics.LastHookReinstallUtc = DateTime.UtcNow;
+            SetDiagnosticDecision("Keyboard hook переустановлен");
+            MessageBox.Show("Keyboard hook переустановлен.", "Switcher", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            SetDiagnosticFailure($"Не удалось переустановить hook: {ex.Message}");
+            MessageBox.Show($"Не удалось переустановить hook:\r\n{ex.Message}", "Switcher", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
     }
 
     public void ShowFirstRunHint(bool force)
@@ -1021,6 +1108,36 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         }
     }
 
+    private void CheckHookHealth()
+    {
+        if (!_settings.AutoHealKeyboardHook)
+        {
+            return;
+        }
+
+        var now = DateTime.UtcNow;
+        var lastEvent = _keyboardHook.LastEventUtc ?? _diagnostics.LastHookEventUtc ?? _diagnostics.StartedAtUtc;
+        var stale = now - lastEvent > HookStaleAfter;
+        var cooldownPassed = _diagnostics.LastHookReinstallUtc is not { } lastRepair
+            || now - lastRepair > HookRepairCooldown;
+        if (!_keyboardHook.IsInstalled || (stale && cooldownPassed))
+        {
+            try
+            {
+                _keyboardHook.Reinstall();
+                _diagnostics.HookReinstallCount++;
+                _diagnostics.LastHookReinstallUtc = now;
+                SetDiagnosticDecision(stale
+                    ? "Keyboard hook переустановлен автоматически после долгой тишины"
+                    : "Keyboard hook переустановлен автоматически");
+            }
+            catch (Exception ex)
+            {
+                SetDiagnosticFailure($"Автовосстановление hook не удалось: {ex.Message}");
+            }
+        }
+    }
+
     private void StoreUpdateCheckResult(UpdateInfo update)
     {
         _availableUpdate = update.IsNewer ? update : null;
@@ -1075,10 +1192,46 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         }
     }
 
+    private bool SwitchLayoutAndReplace(KeyboardLayout targetLayout, int backspaceCount, string text, out string inputMethod)
+    {
+        var layoutSwitch = NativeMethods.SwitchForegroundLayout(targetLayout);
+        StoreLayoutSwitch(layoutSwitch);
+
+        if (InputSender.ReplaceText(backspaceCount, text))
+        {
+            inputMethod = "Unicode SendInput";
+            _diagnostics.LastInputMethod = inputMethod;
+            return true;
+        }
+
+        if (_settings.ClipboardFallback && InputSender.ReplaceTextViaClipboard(backspaceCount, text))
+        {
+            inputMethod = "Clipboard fallback";
+            _diagnostics.LastInputMethod = inputMethod;
+            SetDiagnosticDecision($"Замена выполнена запасным способом: {inputMethod}");
+            return true;
+        }
+
+        inputMethod = "ошибка ввода";
+        _diagnostics.LastInputMethod = inputMethod;
+        SetDiagnosticFailure("SendInput не принял замену текста, clipboard fallback не помог или выключен");
+        return false;
+    }
+
+    private void StoreLayoutSwitch(LayoutSwitchResult result)
+    {
+        _diagnostics.LastLayoutSwitch = result.ToString();
+        if (!result.Success)
+        {
+            SetDiagnosticFailure("Раскладка не подтвердила переключение: " + result);
+        }
+    }
+
     private void UpdateBalloon(string title, string text)
     {
         _notifyIcon.Text = "Switcher: " + CurrentStatus;
         _settingsForm?.SetLastAction($"{title}: {text}");
+        _settingsForm?.RefreshDiagnostics();
     }
 
     private void AddHistory(string kind, string original, string corrected)
@@ -1120,6 +1273,79 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
             && _settings.ExcludedProcesses.Contains(processName, StringComparer.OrdinalIgnoreCase);
     }
 
+    private void SetDiagnosticDecision(string decision)
+    {
+        _diagnostics.LastDecision = $"{DateTime.Now:HH:mm:ss} {decision}";
+        _settingsForm?.RefreshDiagnostics();
+    }
+
+    private void SetDiagnosticFailure(string failure)
+    {
+        _diagnostics.LastFailure = $"{DateTime.Now:HH:mm:ss} {failure}";
+        _settingsForm?.RefreshDiagnostics();
+    }
+
+    private string BuildDiagnosticsText()
+    {
+        var foreground = NativeMethods.GetForegroundWindowInfo();
+        var now = DateTime.UtcNow;
+        var lastHook = _keyboardHook.LastEventUtc ?? _diagnostics.LastHookEventUtc;
+        var hookAge = lastHook is null ? "нет событий" : FormatAge(now - lastHook.Value);
+        var excluded = foreground.ProcessName.Length > 0
+            && _settings.ExcludedProcesses.Contains(foreground.ProcessName, StringComparer.OrdinalIgnoreCase);
+        var builder = new StringBuilder();
+        builder.AppendLine($"Версия: v{ApplicationInfo.CurrentVersionText}");
+        builder.AppendLine($"Статус: {CurrentStatus}");
+        builder.AppendLine($"Hook: {(_keyboardHook.IsInstalled ? "установлен" : "не установлен")}");
+        builder.AppendLine($"Последнее событие hook: {hookAge}");
+        builder.AppendLine($"Переустановок hook: {_diagnostics.HookReinstallCount}");
+        builder.AppendLine($"Последний ремонт hook: {FormatLocal(_diagnostics.LastHookReinstallUtc)}");
+        builder.AppendLine();
+        builder.AppendLine($"Активный процесс: {foreground.ProcessName}{(excluded ? " (исключён)" : "")}");
+        builder.AppendLine($"Заголовок окна: {foreground.Title}");
+        builder.AppendLine($"Путь: {foreground.ProcessPath}");
+        builder.AppendLine($"Раскладка окна: {foreground.LayoutName}");
+        builder.AppendLine();
+        builder.AppendLine($"Текущее слово: {_diagnostics.CurrentWord}");
+        builder.AppendLine($"Последнее слово: {_diagnostics.LastWord}");
+        builder.AppendLine($"Последняя клавиша: {_diagnostics.LastKey}");
+        builder.AppendLine($"Последнее решение: {_diagnostics.LastDecision}");
+        builder.AppendLine($"Последняя ошибка: {_diagnostics.LastFailure}");
+        builder.AppendLine($"Последняя смена раскладки: {_diagnostics.LastLayoutSwitch}");
+        builder.AppendLine($"Последний ввод: {_diagnostics.LastInputMethod}");
+        builder.AppendLine();
+        builder.AppendLine($"Автоисправление: {(_settings.AutoSwitch ? "включено" : "выключено")}");
+        builder.AppendLine($"Смелый режим коротких слов: {(_settings.AggressiveShortWords ? "включен" : "выключен")}");
+        builder.AppendLine($"Clipboard fallback: {(_settings.ClipboardFallback ? "включен" : "выключен")}");
+        builder.AppendLine($"Автовосстановление hook: {(_settings.AutoHealKeyboardHook ? "включено" : "выключено")}");
+        return builder.ToString();
+    }
+
+    private static string FormatAge(TimeSpan age)
+    {
+        if (age.TotalSeconds < 1)
+        {
+            return "только что";
+        }
+
+        if (age.TotalMinutes < 1)
+        {
+            return $"{age.TotalSeconds:N0} сек. назад";
+        }
+
+        if (age.TotalHours < 1)
+        {
+            return $"{age.TotalMinutes:N0} мин. назад";
+        }
+
+        return $"{age.TotalHours:N1} ч. назад";
+    }
+
+    private static string FormatLocal(DateTime? utc)
+    {
+        return utc is null ? "нет" : utc.Value.ToLocalTime().ToString("dd.MM.yyyy HH:mm:ss");
+    }
+
     private static string TrimForStatus(string text)
     {
         var normalized = text.ReplaceLineEndings(" ").Trim();
@@ -1138,6 +1364,9 @@ internal sealed class SettingsForm : Form
     private readonly CheckBox _startup = new();
     private readonly CheckBox _autoCheckUpdates = new();
     private readonly CheckBox _learnFromManualCorrections = new();
+    private readonly CheckBox _aggressiveShortWords = new();
+    private readonly CheckBox _clipboardFallback = new();
+    private readonly CheckBox _autoHealKeyboardHook = new();
     private readonly ComboBox _enToRuSound = new();
     private readonly ComboBox _ruToEnSound = new();
     private readonly Label _hotkeysLabel = new();
@@ -1148,7 +1377,9 @@ internal sealed class SettingsForm : Form
     private readonly TextBox _excludedProcesses = new();
     private readonly TextBox _russianWords = new();
     private readonly TextBox _englishWords = new();
+    private readonly TextBox _neverCorrectWords = new();
     private readonly TextBox _autoReplacements = new();
+    private readonly TextBox _diagnostics = new();
     private readonly ListBox _history = new();
     private readonly Label _installStatus = new();
     private readonly Label _updateStatus = new();
@@ -1160,6 +1391,8 @@ internal sealed class SettingsForm : Form
     private readonly Button _resetHotkeysButton = new();
     private readonly Button _saveReplacementsButton = new();
     private readonly Button _clearLearnedReplacementsButton = new();
+    private readonly Button _refreshDiagnosticsButton = new();
+    private readonly Button _reinstallHookButton = new();
     private readonly Button _exportSettingsButton = new();
     private readonly Button _importSettingsButton = new();
     private readonly Button _showFirstRunHintButton = new();
@@ -1205,12 +1438,14 @@ internal sealed class SettingsForm : Form
         var tabs = new TabControl
         {
             Dock = DockStyle.Fill,
+            Multiline = true,
         };
         tabs.TabPages.Add(CreateGeneralTab());
         tabs.TabPages.Add(CreateListsTab());
         tabs.TabPages.Add(CreateReplacementsTab());
         tabs.TabPages.Add(CreateSettingsTab());
         tabs.TabPages.Add(CreateHistoryTab());
+        tabs.TabPages.Add(CreateDiagnosticsTab());
         tabs.TabPages.Add(CreateInstallTab());
         root.Controls.Add(tabs, 0, 2);
 
@@ -1242,6 +1477,9 @@ internal sealed class SettingsForm : Form
         _startup.Checked = StartupManager.IsEnabledForPath(InstallManager.PreferredStartupPath);
         _autoCheckUpdates.Checked = _context.Settings.AutoCheckUpdates;
         _learnFromManualCorrections.Checked = _context.Settings.LearnFromManualCorrections;
+        _aggressiveShortWords.Checked = _context.Settings.AggressiveShortWords;
+        _clipboardFallback.Checked = _context.Settings.ClipboardFallback;
+        _autoHealKeyboardHook.Checked = _context.Settings.AutoHealKeyboardHook;
         SetComboValue(_enToRuSound, _context.Settings.EnToRuSound);
         SetComboValue(_ruToEnSound, _context.Settings.RuToEnSound);
         _convertWordHotkey.SetBinding(_context.Settings.ConvertWordHotkey);
@@ -1251,12 +1489,14 @@ internal sealed class SettingsForm : Form
         _excludedProcesses.Text = LinesFrom(_context.Settings.ExcludedProcesses);
         _russianWords.Text = LinesFrom(_context.Settings.CustomRussianWords);
         _englishWords.Text = LinesFrom(_context.Settings.CustomEnglishWords);
+        _neverCorrectWords.Text = LinesFrom(_context.Settings.CustomNeverCorrectWords);
         _autoReplacements.Text = ReplacementLinesFrom(_context.Settings.CustomAutoReplacements);
         _updating = false;
 
         UpdateStatus();
         UpdateHotkeysLabel();
         RefreshHistory();
+        RefreshDiagnostics();
         RefreshInstallState();
     }
 
@@ -1319,6 +1559,25 @@ internal sealed class SettingsForm : Form
         UpdateStatus();
     }
 
+    public void RefreshDiagnostics()
+    {
+        if (IsDisposed)
+        {
+            return;
+        }
+
+        if (InvokeRequired)
+        {
+            BeginInvoke(RefreshDiagnostics);
+            return;
+        }
+
+        if (!_diagnostics.Focused)
+        {
+            _diagnostics.Text = _context.DiagnosticsText;
+        }
+    }
+
     private TabPage CreateGeneralTab()
     {
         var page = new TabPage("Основное");
@@ -1326,10 +1585,10 @@ internal sealed class SettingsForm : Form
         {
             Dock = DockStyle.Fill,
             Padding = new Padding(14),
-            RowCount = 10,
+            RowCount = 12,
             ColumnCount = 1,
         };
-        for (var i = 0; i < 5; i++)
+        for (var i = 0; i < 7; i++)
         {
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
         }
@@ -1345,14 +1604,20 @@ internal sealed class SettingsForm : Form
         ConfigureCheckBox(_sound, "Проигрывать звук при смене раскладки");
         ConfigureCheckBox(_paused, "Пауза");
         ConfigureCheckBox(_startup, "Запускать вместе с Windows");
+        ConfigureCheckBox(_aggressiveShortWords, "Смелее исправлять короткие слова");
+        ConfigureCheckBox(_clipboardFallback, "Использовать буфер обмена, если обычная замена не сработала");
+        ConfigureCheckBox(_autoHealKeyboardHook, "Автоматически переустанавливать keyboard hook после долгой тишины");
         layout.Controls.Add(_autoSwitch, 0, 0);
         layout.Controls.Add(_sound, 0, 1);
         layout.Controls.Add(_paused, 0, 2);
         layout.Controls.Add(_startup, 0, 3);
+        layout.Controls.Add(_aggressiveShortWords, 0, 4);
+        layout.Controls.Add(_clipboardFallback, 0, 5);
+        layout.Controls.Add(_autoHealKeyboardHook, 0, 6);
 
         _hotkeysLabel.Dock = DockStyle.Fill;
         _hotkeysLabel.ForeColor = Color.FromArgb(51, 65, 85);
-        layout.Controls.Add(_hotkeysLabel, 0, 5);
+        layout.Controls.Add(_hotkeysLabel, 0, 7);
 
         var soundGrid = new TableLayoutPanel
         {
@@ -1367,11 +1632,11 @@ internal sealed class SettingsForm : Form
         ConfigureCombo(_ruToEnSound);
         AddSoundRow(soundGrid, 0, "EN -> RU", _enToRuSound, () => _context.TestSound(LayoutDirection.LatinToCyrillic));
         AddSoundRow(soundGrid, 1, "RU -> EN", _ruToEnSound, () => _context.TestSound(LayoutDirection.CyrillicToLatin));
-        layout.Controls.Add(soundGrid, 0, 6);
+        layout.Controls.Add(soundGrid, 0, 8);
 
         _lastActionLabel.Dock = DockStyle.Fill;
         _lastActionLabel.ForeColor = Color.FromArgb(71, 85, 105);
-        layout.Controls.Add(_lastActionLabel, 0, 8);
+        layout.Controls.Add(_lastActionLabel, 0, 10);
 
         return page;
     }
@@ -1480,12 +1745,13 @@ internal sealed class SettingsForm : Form
         {
             Dock = DockStyle.Fill,
             Padding = new Padding(14),
-            ColumnCount = 3,
+            ColumnCount = 4,
             RowCount = 3,
         };
-        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 34));
-        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33));
-        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
@@ -1494,12 +1760,15 @@ internal sealed class SettingsForm : Form
         AddHeader(layout, 0, "Исключённые процессы");
         AddHeader(layout, 1, "Русские слова");
         AddHeader(layout, 2, "Английские слова");
+        AddHeader(layout, 3, "Никогда не исправлять");
         ConfigureTextArea(_excludedProcesses);
         ConfigureTextArea(_russianWords);
         ConfigureTextArea(_englishWords);
+        ConfigureTextArea(_neverCorrectWords);
         layout.Controls.Add(_excludedProcesses, 0, 1);
         layout.Controls.Add(_russianWords, 1, 1);
         layout.Controls.Add(_englishWords, 2, 1);
+        layout.Controls.Add(_neverCorrectWords, 3, 1);
 
         var save = new Button
         {
@@ -1515,9 +1784,10 @@ internal sealed class SettingsForm : Form
                 s.ExcludedProcesses = ParseLines(_excludedProcesses.Text);
                 s.CustomRussianWords = ParseLines(_russianWords.Text);
                 s.CustomEnglishWords = ParseLines(_englishWords.Text);
+                s.CustomNeverCorrectWords = ParseLines(_neverCorrectWords.Text);
             });
         };
-        layout.Controls.Add(save, 2, 2);
+        layout.Controls.Add(save, 3, 2);
 
         return page;
     }
@@ -1600,6 +1870,37 @@ internal sealed class SettingsForm : Form
         };
         clear.Click += (_, _) => _context.ClearHistory();
         layout.Controls.Add(clear, 0, 1);
+        return page;
+    }
+
+    private TabPage CreateDiagnosticsTab()
+    {
+        var page = new TabPage("Диагностика");
+        var layout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            Padding = new Padding(14),
+            RowCount = 2,
+            ColumnCount = 1,
+        };
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
+        page.Controls.Add(layout);
+
+        ConfigureTextArea(_diagnostics);
+        _diagnostics.ReadOnly = true;
+        layout.Controls.Add(_diagnostics, 0, 0);
+
+        var buttons = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.LeftToRight,
+        };
+        ConfigureButton(_refreshDiagnosticsButton, "Обновить диагностику", 220);
+        ConfigureButton(_reinstallHookButton, "Переустановить hook", 210);
+        buttons.Controls.Add(_refreshDiagnosticsButton);
+        buttons.Controls.Add(_reinstallHookButton);
+        layout.Controls.Add(buttons, 0, 1);
         return page;
     }
 
@@ -1731,6 +2032,27 @@ internal sealed class SettingsForm : Form
                 _context.UpdateSettings(s => s.LearnFromManualCorrections = _learnFromManualCorrections.Checked);
             }
         };
+        _aggressiveShortWords.CheckedChanged += (_, _) =>
+        {
+            if (!_updating)
+            {
+                _context.UpdateSettings(s => s.AggressiveShortWords = _aggressiveShortWords.Checked);
+            }
+        };
+        _clipboardFallback.CheckedChanged += (_, _) =>
+        {
+            if (!_updating)
+            {
+                _context.UpdateSettings(s => s.ClipboardFallback = _clipboardFallback.Checked);
+            }
+        };
+        _autoHealKeyboardHook.CheckedChanged += (_, _) =>
+        {
+            if (!_updating)
+            {
+                _context.UpdateSettings(s => s.AutoHealKeyboardHook = _autoHealKeyboardHook.Checked);
+            }
+        };
         _enToRuSound.SelectedIndexChanged += (_, _) =>
         {
             if (!_updating && _enToRuSound.SelectedItem is string value)
@@ -1770,6 +2092,8 @@ internal sealed class SettingsForm : Form
         _resetHotkeysButton.Click += (_, _) => ResetHotkeys();
         _saveReplacementsButton.Click += (_, _) => SaveReplacements();
         _clearLearnedReplacementsButton.Click += (_, _) => ClearLearnedReplacements();
+        _refreshDiagnosticsButton.Click += (_, _) => RefreshDiagnostics();
+        _reinstallHookButton.Click += (_, _) => _context.ReinstallKeyboardHook();
         _exportSettingsButton.Click += (_, _) => ExportSettings();
         _importSettingsButton.Click += (_, _) => ImportSettings();
         _showFirstRunHintButton.Click += (_, _) => _context.ShowFirstRunHint(force: true);
@@ -2157,12 +2481,48 @@ internal sealed class KeyboardHook : IDisposable
 
     private readonly NativeMethods.LowLevelKeyboardProc _proc;
     private readonly Func<Keys, int, bool> _handler;
+    private readonly object _sync = new();
     private IntPtr _hookId;
 
     public KeyboardHook(Func<Keys, int, bool> handler)
     {
         _handler = handler;
         _proc = HookCallback;
+        Install();
+    }
+
+    public DateTime? LastEventUtc { get; private set; }
+
+    public bool IsInstalled
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _hookId != IntPtr.Zero;
+            }
+        }
+    }
+
+    public void Reinstall()
+    {
+        lock (_sync)
+        {
+            Uninstall();
+            Install();
+        }
+    }
+
+    public void Dispose()
+    {
+        lock (_sync)
+        {
+            Uninstall();
+        }
+    }
+
+    private void Install()
+    {
         using var process = Process.GetCurrentProcess();
         using var module = process.MainModule;
         var moduleHandle = NativeMethods.GetModuleHandle(module?.ModuleName);
@@ -2174,7 +2534,7 @@ internal sealed class KeyboardHook : IDisposable
         }
     }
 
-    public void Dispose()
+    private void Uninstall()
     {
         if (_hookId != IntPtr.Zero)
         {
@@ -2190,6 +2550,7 @@ internal sealed class KeyboardHook : IDisposable
             var data = Marshal.PtrToStructure<NativeMethods.Kbdllhookstruct>(lParam);
             if ((data.Flags & LlkInjected) == 0)
             {
+                LastEventUtc = DateTime.UtcNow;
                 var handled = _handler((Keys)data.VkCode, data.ScanCode);
                 if (handled)
                 {
@@ -2407,6 +2768,9 @@ internal sealed record AppSettings
     public bool StartWithWindows { get; set; }
     public bool AutoCheckUpdates { get; set; } = true;
     public bool LearnFromManualCorrections { get; set; } = true;
+    public bool AggressiveShortWords { get; set; }
+    public bool ClipboardFallback { get; set; } = true;
+    public bool AutoHealKeyboardHook { get; set; } = true;
     public bool FirstRunHintShown { get; set; }
     public DateTime? LastUpdateCheckUtc { get; set; }
     public string EnToRuSound { get; set; } = SoundPlayerNames.Asterisk;
@@ -2431,6 +2795,7 @@ internal sealed record AppSettings
 
     public List<string> CustomRussianWords { get; set; } = [];
     public List<string> CustomEnglishWords { get; set; } = [];
+    public List<string> CustomNeverCorrectWords { get; set; } = [];
     public List<AutoReplacementRule> CustomAutoReplacements { get; set; } = [];
     public List<CorrectionHistoryItem> History { get; set; } = [];
 }
@@ -2641,11 +3006,13 @@ internal static class SettingsStore
         settings.ExcludedProcesses ??= [];
         settings.CustomRussianWords ??= [];
         settings.CustomEnglishWords ??= [];
+        settings.CustomNeverCorrectWords ??= [];
         settings.CustomAutoReplacements ??= [];
         settings.History ??= [];
         settings.ExcludedProcesses = NormalizeList(settings.ExcludedProcesses);
         settings.CustomRussianWords = NormalizeList(settings.CustomRussianWords);
         settings.CustomEnglishWords = NormalizeList(settings.CustomEnglishWords);
+        settings.CustomNeverCorrectWords = NormalizeList(settings.CustomNeverCorrectWords);
         settings.CustomAutoReplacements = AutoReplacementRule.Normalize(settings.CustomAutoReplacements);
         settings.History = settings.History
             .Where(item => !string.IsNullOrWhiteSpace(item.Original) || !string.IsNullOrWhiteSpace(item.Corrected))
@@ -3097,6 +3464,21 @@ internal sealed record LastCorrection(
     KeyboardLayout SourceLayout,
     KeyboardLayout TargetLayout);
 
+internal sealed class DiagnosticState
+{
+    public DateTime StartedAtUtc { get; } = DateTime.UtcNow;
+    public DateTime? LastHookEventUtc { get; set; }
+    public DateTime? LastHookReinstallUtc { get; set; }
+    public int HookReinstallCount { get; set; }
+    public string CurrentWord { get; set; } = "";
+    public string LastWord { get; set; } = "";
+    public string LastKey { get; set; } = "";
+    public string LastDecision { get; set; } = "ожидание ввода";
+    public string LastFailure { get; set; } = "нет";
+    public string LastLayoutSwitch { get; set; } = "нет";
+    public string LastInputMethod { get; set; } = "нет";
+}
+
 internal sealed record CorrectionResult(
     string Text,
     LayoutDirection Direction,
@@ -3114,6 +3496,33 @@ internal enum KeyboardLayout
     English,
     Russian,
 }
+
+internal enum DetectedKeyboardLayout
+{
+    English,
+    Russian,
+    Other,
+    Unknown,
+}
+
+internal sealed record LayoutSwitchResult(
+    KeyboardLayout Target,
+    string Before,
+    string After,
+    bool Success,
+    int Attempts)
+{
+    public override string ToString()
+    {
+        return $"{Before} -> {After}, цель {Target}, попыток {Attempts}, {(Success ? "успех" : "не подтверждено")}";
+    }
+}
+
+internal sealed record ForegroundWindowInfo(
+    string ProcessName,
+    string ProcessPath,
+    string Title,
+    string LayoutName);
 
 internal static class TextHeuristics
 {
@@ -3190,14 +3599,34 @@ internal static class TextHeuristics
 
     public static bool TryAutoCorrect(string word, AppSettings settings, out CorrectionResult correction)
     {
+        return TryAutoCorrect(word, settings, out correction, out _);
+    }
+
+    public static bool TryAutoCorrect(string word, AppSettings settings, out CorrectionResult correction, out string reason)
+    {
         correction = default!;
+        reason = "";
+        if (IsNeverCorrectWord(word, settings))
+        {
+            reason = "слово в списке 'никогда не исправлять'";
+            return false;
+        }
+
         if (TryCustomAutoReplacement(word, settings, out correction))
         {
+            reason = "точечная пользовательская замена";
             return true;
         }
 
-        if (word.Length < 2 || !TryConvertAny(word, out var converted))
+        if (word.Length < 2)
         {
+            reason = "слово короче 2 символов";
+            return false;
+        }
+
+        if (!TryConvertAny(word, out var converted))
+        {
+            reason = "слово не состоит целиком из русских или английских букв";
             return false;
         }
 
@@ -3213,6 +3642,7 @@ internal static class TextHeuristics
             : IsKnownRussianWord(word, settings);
         if (sourceIsKnownWord)
         {
+            reason = "исходное слово уже похоже на известное слово";
             return false;
         }
 
@@ -3220,23 +3650,34 @@ internal static class TextHeuristics
             ? IsKnownRussianWord(converted.Text, settings)
             : IsKnownEnglishWord(converted.Text, settings);
 
-        if (word.Length < 4 && !targetIsKnownWord)
+        if (word.Length < 4 && !targetIsKnownWord && !settings.AggressiveShortWords)
         {
+            reason = "короткое слово, цель не найдена в словаре, смелый режим выключен";
             return false;
         }
 
         if (targetIsKnownWord && targetScore - sourceScore >= 8)
         {
             correction = converted;
+            reason = $"цель есть в словаре, score {sourceScore}->{targetScore}";
+            return true;
+        }
+
+        if (word.Length < 4 && settings.AggressiveShortWords && targetScore >= 10 && targetScore - sourceScore >= 8)
+        {
+            correction = converted;
+            reason = $"смелый режим коротких слов, score {sourceScore}->{targetScore}";
             return true;
         }
 
         if (targetScore >= 22 && targetScore - sourceScore >= 14)
         {
             correction = converted;
+            reason = $"эвристика уверена, score {sourceScore}->{targetScore}";
             return true;
         }
 
+        reason = $"недостаточная уверенность, score {sourceScore}->{targetScore}, цель известна: {targetIsKnownWord}";
         return false;
     }
 
@@ -3472,6 +3913,11 @@ internal static class TextHeuristics
         return EnglishWords.Contains(word) || settings.CustomEnglishWords.Contains(word, StringComparer.OrdinalIgnoreCase);
     }
 
+    private static bool IsNeverCorrectWord(string word, AppSettings settings)
+    {
+        return settings.CustomNeverCorrectWords.Contains(word, StringComparer.OrdinalIgnoreCase);
+    }
+
     private static string ConvertWithMap(string text, IReadOnlyDictionary<char, char> map)
     {
         var builder = new StringBuilder(text.Length);
@@ -3613,6 +4059,53 @@ internal static class InputSender
         return NativeMethods.SendKeyboardInput(inputs.ToArray());
     }
 
+    public static bool ReplaceTextViaClipboard(int backspaceCount, string text)
+    {
+        using var clipboard = ClipboardBackup.Capture();
+        try
+        {
+            if (backspaceCount > 0 && !SendBackspaces(backspaceCount))
+            {
+                return false;
+            }
+
+            Thread.Sleep(35);
+            if (text.Length > 0)
+            {
+                Clipboard.SetText(text, TextDataFormat.UnicodeText);
+                if (!SendChord(Keys.ControlKey, Keys.V))
+                {
+                    return false;
+                }
+
+                Thread.Sleep(90);
+            }
+
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool SendBackspaces(int count)
+    {
+        if (count <= 0)
+        {
+            return true;
+        }
+
+        var inputs = new List<NativeMethods.Input>(count * 2);
+        for (var i = 0; i < count; i++)
+        {
+            inputs.Add(KeyboardInput((ushort)Keys.Back, 0, 0));
+            inputs.Add(KeyboardInput((ushort)Keys.Back, 0, KeyeventfKeyup));
+        }
+
+        return NativeMethods.SendKeyboardInput(inputs.ToArray());
+    }
+
     public static bool SendChord(params Keys[] keys)
     {
         if (keys.Length == 0)
@@ -3658,6 +4151,8 @@ internal static class NativeMethods
 {
     private const uint KlfActivate = 0x00000001;
     private const int WmInputLangChangeRequest = 0x0050;
+    private const int RussianLocaleId = 0x0419;
+    private const int EnglishLocaleId = 0x0409;
     private const string EnglishLayoutId = "00000409";
     private const string RussianLayoutId = "00000419";
 
@@ -3752,22 +4247,37 @@ internal static class NativeMethods
         return result > 0 ? buffer.ToString(0, result) : string.Empty;
     }
 
-    public static void SwitchForegroundLayout(KeyboardLayout layout)
+    public static LayoutSwitchResult SwitchForegroundLayout(KeyboardLayout layout)
     {
+        var before = DescribeKeyboardLayout(GetForegroundKeyboardLayout());
         var layoutId = layout == KeyboardLayout.Russian ? RussianLayoutId : EnglishLayoutId;
         var hkl = LoadKeyboardLayout(layoutId, KlfActivate);
         if (hkl == IntPtr.Zero)
         {
-            return;
+            return new LayoutSwitchResult(layout, before, before, false, 0);
         }
 
-        var foreground = GetForegroundWindow();
-        if (foreground != IntPtr.Zero)
+        var attempts = 0;
+        for (var attempt = 1; attempt <= 3; attempt++)
         {
-            PostMessage(foreground, WmInputLangChangeRequest, IntPtr.Zero, hkl);
+            attempts = attempt;
+            var foreground = GetForegroundWindow();
+            if (foreground != IntPtr.Zero)
+            {
+                PostMessage(foreground, WmInputLangChangeRequest, IntPtr.Zero, hkl);
+            }
+
+            ActivateKeyboardLayout(hkl, KlfActivate);
+            Thread.Sleep(35 * attempt);
+
+            var current = GetForegroundKeyboardLayout();
+            if (MatchesKeyboardLayout(current, layout))
+            {
+                return new LayoutSwitchResult(layout, before, DescribeKeyboardLayout(current), true, attempts);
+            }
         }
 
-        ActivateKeyboardLayout(hkl, 0);
+        return new LayoutSwitchResult(layout, before, DescribeKeyboardLayout(GetForegroundKeyboardLayout()), false, attempts);
     }
 
     public static string GetForegroundProcessName()
@@ -3795,11 +4305,84 @@ internal static class NativeMethods
         }
     }
 
+    public static ForegroundWindowInfo GetForegroundWindowInfo()
+    {
+        try
+        {
+            var foreground = GetForegroundWindow();
+            if (foreground == IntPtr.Zero)
+            {
+                return new ForegroundWindowInfo("", "", "", "Unknown");
+            }
+
+            GetWindowThreadProcessId(foreground, out var processId);
+            var title = new StringBuilder(512);
+            GetWindowText(foreground, title, title.Capacity);
+            var processName = "";
+            var processPath = "";
+            if (processId != 0)
+            {
+                try
+                {
+                    using var process = Process.GetProcessById((int)processId);
+                    processName = process.ProcessName;
+                    processPath = process.MainModule?.FileName ?? "";
+                }
+                catch
+                {
+                    processName = processId.ToString();
+                }
+            }
+
+            return new ForegroundWindowInfo(
+                processName,
+                processPath,
+                title.ToString(),
+                DescribeKeyboardLayout(GetForegroundKeyboardLayout()));
+        }
+        catch
+        {
+            return new ForegroundWindowInfo("", "", "", "Unknown");
+        }
+    }
+
     private static IntPtr GetForegroundKeyboardLayout()
     {
         var foreground = GetForegroundWindow();
         var threadId = GetWindowThreadProcessId(foreground, out _);
         return GetKeyboardLayout(threadId);
+    }
+
+    private static bool MatchesKeyboardLayout(IntPtr hkl, KeyboardLayout layout)
+    {
+        var localeId = GetLocaleId(hkl);
+        return layout switch
+        {
+            KeyboardLayout.Russian => localeId == RussianLocaleId,
+            KeyboardLayout.English => localeId == EnglishLocaleId,
+            _ => false,
+        };
+    }
+
+    private static string DescribeKeyboardLayout(IntPtr hkl)
+    {
+        if (hkl == IntPtr.Zero)
+        {
+            return "Unknown";
+        }
+
+        var localeId = GetLocaleId(hkl);
+        return localeId switch
+        {
+            EnglishLocaleId => $"EN ({localeId:X4})",
+            RussianLocaleId => $"RU ({localeId:X4})",
+            _ => $"Other ({localeId:X4})",
+        };
+    }
+
+    private static int GetLocaleId(IntPtr hkl)
+    {
+        return unchecked((int)((long)hkl & 0xFFFF));
     }
 
     [DllImport("user32.dll", SetLastError = true)]
@@ -3834,6 +4417,9 @@ internal static class NativeMethods
 
     [DllImport("user32.dll")]
     private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
 
     [DllImport("user32.dll")]
     private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
