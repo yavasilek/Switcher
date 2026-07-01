@@ -1,11 +1,13 @@
 using System.Diagnostics;
 using System.Drawing.Drawing2D;
+using System.Globalization;
 using System.Media;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Interop.UIAutomationClient;
 using Microsoft.Win32;
 
 namespace Switcher;
@@ -111,6 +113,7 @@ internal static class SelfTest
         CheckDefaultReplacements(failures);
         CheckSettingsRoundTrip(failures);
         CheckListImportParser(failures);
+        CheckPasswordDetectionFormatting(failures);
         CheckInputSize(failures);
         CheckDownloadProgress(failures);
 
@@ -326,6 +329,18 @@ internal static class SelfTest
         }
     }
 
+    private static void CheckPasswordDetectionFormatting(List<string> failures)
+    {
+        var detection = new PasswordFieldDetection(true, "UI Automation IsPassword", "control=Edit", new DateTime(2026, 1, 1, 12, 30, 0));
+        var text = detection.ToDiagnosticText();
+        if (!text.Contains("да", StringComparison.Ordinal)
+            || !text.Contains("UI Automation", StringComparison.Ordinal)
+            || !text.Contains("12:30:00", StringComparison.Ordinal))
+        {
+            failures.Add($"PASSWORD diagnostic: unexpected text {text}");
+        }
+    }
+
     private static void CheckInputSize(List<string> failures)
     {
         var actual = Marshal.SizeOf<NativeMethods.Input>();
@@ -358,6 +373,8 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
     private static readonly TimeSpan UpdateCheckInterval = TimeSpan.FromHours(12);
     private static readonly TimeSpan HookStaleAfter = TimeSpan.FromMinutes(20);
     private static readonly TimeSpan HookRepairCooldown = TimeSpan.FromMinutes(10);
+    private static readonly TimeSpan PasswordPositiveCacheTtl = TimeSpan.FromMilliseconds(700);
+    private static readonly TimeSpan PasswordNegativeCacheTtl = TimeSpan.FromMilliseconds(120);
 
     private readonly Control _uiThread = new();
     private readonly NotifyIcon _notifyIcon;
@@ -366,6 +383,9 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
     private readonly StringBuilder _currentWord = new();
     private readonly DiagnosticState _diagnostics = new();
     private SettingsForm? _settingsForm;
+    private ForegroundFocusKey _passwordDetectionKey;
+    private PasswordFieldDetection _passwordDetection = PasswordFieldDetection.NotChecked;
+    private DateTime _passwordDetectionUtc = DateTime.MinValue;
     private LastTypedSegment? _lastTypedSegment;
     private LastCorrection? _lastCorrection;
     private UpdateInfo? _availableUpdate;
@@ -711,11 +731,16 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
             return false;
         }
 
-        if (_settings.IgnorePasswordFields && NativeMethods.IsForegroundPasswordField())
+        if (_settings.IgnorePasswordFields)
         {
-            SetDiagnosticDecision("Пропуск: похоже на поле пароля");
-            ResetTypingState();
-            return false;
+            var passwordDetection = DetectForegroundPasswordField();
+            _diagnostics.LastPasswordDetection = passwordDetection;
+            if (passwordDetection.IsPassword)
+            {
+                SetDiagnosticDecision($"Пропуск: поле пароля ({passwordDetection.Source})");
+                ResetTypingState();
+                return false;
+            }
         }
 
         if (IsForegroundProcessExcluded(out var excludedProcess))
@@ -1578,6 +1603,22 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         _settingsForm?.RefreshReplacementRules();
     }
 
+    private PasswordFieldDetection DetectForegroundPasswordField()
+    {
+        var now = DateTime.UtcNow;
+        var key = NativeMethods.GetForegroundFocusKey();
+        var ttl = _passwordDetection.IsPassword ? PasswordPositiveCacheTtl : PasswordNegativeCacheTtl;
+        if (key == _passwordDetectionKey && now - _passwordDetectionUtc <= ttl)
+        {
+            return _passwordDetection;
+        }
+
+        _passwordDetection = NativeMethods.DetectForegroundPasswordField();
+        _passwordDetectionKey = key;
+        _passwordDetectionUtc = now;
+        return _passwordDetection;
+    }
+
     private bool IsForegroundProcessExcluded(out string processName)
     {
         processName = NativeMethods.GetForegroundProcessName();
@@ -1629,6 +1670,7 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         builder.AppendLine($"Автоисправление: {(_settings.AutoSwitch ? "включено" : "выключено")}");
         builder.AppendLine($"Профиль исправлений: {DisplayProfile(_settings.CorrectionProfile)}");
         builder.AppendLine($"Защита password-полей: {(_settings.IgnorePasswordFields ? "включена" : "выключена")}");
+        builder.AppendLine($"Текущее password-поле: {(_settings.IgnorePasswordFields ? _diagnostics.LastPasswordDetection.ToDiagnosticText() : "не проверяется")}");
         builder.AppendLine($"Смелый режим коротких слов: {(_settings.AggressiveShortWords ? "включен" : "выключен")}");
         builder.AppendLine($"Clipboard fallback: {(_settings.ClipboardFallback ? "включен" : "выключен")}");
         builder.AppendLine($"Автовосстановление hook: {(_settings.AutoHealKeyboardHook ? "включено" : "выключено")}");
@@ -5032,6 +5074,24 @@ internal sealed record LastCorrection(
     KeyboardLayout SourceLayout,
     KeyboardLayout TargetLayout);
 
+internal readonly record struct ForegroundFocusKey(IntPtr ForegroundWindow, IntPtr FocusedControl);
+
+internal sealed record PasswordFieldDetection(bool IsPassword, string Source, string Detail, DateTime CheckedAt)
+{
+    public static PasswordFieldDetection NotChecked { get; } = new(false, "нет", "ещё не проверялось", DateTime.MinValue);
+
+    public string ToDiagnosticText()
+    {
+        if (CheckedAt == DateTime.MinValue)
+        {
+            return Detail;
+        }
+
+        var status = IsPassword ? "да" : "нет";
+        return $"{status}; {Source}: {Detail}; {CheckedAt:HH:mm:ss}";
+    }
+}
+
 internal sealed class DiagnosticState
 {
     public DateTime StartedAtUtc { get; } = DateTime.UtcNow;
@@ -5045,6 +5105,7 @@ internal sealed class DiagnosticState
     public string LastFailure { get; set; } = "нет";
     public string LastLayoutSwitch { get; set; } = "нет";
     public string LastInputMethod { get; set; } = "нет";
+    public PasswordFieldDetection LastPasswordDetection { get; set; } = PasswordFieldDetection.NotChecked;
 }
 
 internal sealed record CorrectionResult(
@@ -5989,14 +6050,55 @@ internal static class NativeMethods
         }
     }
 
-    public static bool IsForegroundPasswordField()
+    public static ForegroundFocusKey GetForegroundFocusKey()
     {
         try
         {
             var foreground = GetForegroundWindow();
             if (foreground == IntPtr.Zero)
             {
-                return false;
+                return default;
+            }
+
+            var threadId = GetWindowThreadProcessId(foreground, out _);
+            var info = GuiThreadInfo.Create();
+            var focused = GetGUIThreadInfo(threadId, ref info) && info.HwndFocus != IntPtr.Zero
+                ? info.HwndFocus
+                : foreground;
+            return new ForegroundFocusKey(foreground, focused);
+        }
+        catch
+        {
+            return default;
+        }
+    }
+
+    public static bool IsForegroundPasswordField()
+    {
+        return DetectForegroundPasswordField().IsPassword;
+    }
+
+    public static PasswordFieldDetection DetectForegroundPasswordField()
+    {
+        var win32 = DetectWin32PasswordField();
+        if (win32.IsPassword)
+        {
+            return win32;
+        }
+
+        var automation = DetectAutomationPasswordField();
+        return automation.IsPassword ? automation : win32 with { Detail = $"{win32.Detail}; {automation.Source}: {automation.Detail}" };
+    }
+
+    private static PasswordFieldDetection DetectWin32PasswordField()
+    {
+        var checkedAt = DateTime.Now;
+        try
+        {
+            var foreground = GetForegroundWindow();
+            if (foreground == IntPtr.Zero)
+            {
+                return new PasswordFieldDetection(false, "Win32", "нет активного окна", checkedAt);
             }
 
             var threadId = GetWindowThreadProcessId(foreground, out _);
@@ -6008,13 +6110,51 @@ internal static class NativeMethods
             var className = new StringBuilder(256);
             GetClassName(focused, className, className.Capacity);
             var passwordChar = SendMessage(focused, EmGetPasswordChar, IntPtr.Zero, IntPtr.Zero);
-            return passwordChar != IntPtr.Zero
-                && className.ToString().Contains("edit", StringComparison.OrdinalIgnoreCase);
+            var classText = className.ToString();
+            var isPassword = passwordChar != IntPtr.Zero
+                && classText.Contains("edit", StringComparison.OrdinalIgnoreCase);
+            var detail = $"class={TrimForDiagnostic(classText)}, passwordChar={(passwordChar == IntPtr.Zero ? "нет" : "да")}";
+            return new PasswordFieldDetection(isPassword, "Win32", detail, checkedAt);
         }
-        catch
+        catch (Exception ex)
         {
-            return false;
+            return new PasswordFieldDetection(false, "Win32", ex.GetType().Name, checkedAt);
         }
+    }
+
+    private static PasswordFieldDetection DetectAutomationPasswordField()
+    {
+        var checkedAt = DateTime.Now;
+        try
+        {
+            var automation = new CUIAutomationClass();
+            var element = automation.GetFocusedElement();
+            if (element is null)
+            {
+                return new PasswordFieldDetection(false, "UI Automation", "фокус не найден", checkedAt);
+            }
+
+            var controlType = element.CurrentControlType.ToString(CultureInfo.InvariantCulture);
+            var className = TrimForDiagnostic(element.CurrentClassName);
+            var automationId = TrimForDiagnostic(element.CurrentAutomationId);
+            var detail = $"control={controlType}, class={className}, id={automationId}";
+            return new PasswordFieldDetection(element.CurrentIsPassword != 0, "UI Automation IsPassword", detail, checkedAt);
+        }
+        catch (Exception ex)
+        {
+            return new PasswordFieldDetection(false, "UI Automation", ex.GetType().Name, checkedAt);
+        }
+    }
+
+    private static string TrimForDiagnostic(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return "-";
+        }
+
+        var normalized = value.ReplaceLineEndings(" ").Trim();
+        return normalized.Length <= 48 ? normalized : normalized[..45] + "...";
     }
 
     public static ForegroundWindowInfo GetForegroundWindowInfo()
