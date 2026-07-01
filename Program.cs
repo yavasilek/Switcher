@@ -108,6 +108,7 @@ internal static class SelfTest
         CheckNoAuto(failures, "test");
         CheckNoAuto(failures, "code");
         CheckNeverCorrect(failures);
+        CheckDefaultReplacements(failures);
         CheckSettingsRoundTrip(failures);
         CheckInputSize(failures);
         CheckDownloadProgress(failures);
@@ -202,6 +203,25 @@ internal static class SelfTest
         }
     }
 
+    private static void CheckDefaultReplacements(List<string> failures)
+    {
+        var rules = AutoReplacementDefaults.Create();
+        if (rules.Count < 120)
+        {
+            failures.Add($"DEFAULT replacements: expected at least 120 rules, actual {rules.Count}");
+        }
+
+        if (!rules.Any(rule => rule.Original == "ghbdtn" && rule.Corrected == "привет"))
+        {
+            failures.Add("DEFAULT replacements: missing ghbdtn -> привет");
+        }
+
+        if (!rules.Any(rule => rule.Original == "руддщ" && rule.Corrected == "hello"))
+        {
+            failures.Add("DEFAULT replacements: missing руддщ -> hello");
+        }
+    }
+
     private static void CheckSettingsRoundTrip(List<string> failures)
     {
         var path = Path.Combine(Path.GetTempPath(), $"Switcher.settings.{Guid.NewGuid():N}.json");
@@ -221,6 +241,7 @@ internal static class SelfTest
                 LearnFromManualCorrections = true,
                 CorrectionProfile = CorrectionProfile.Bold,
                 DarkTheme = true,
+                BuiltInReplacementsVersion = AutoReplacementDefaults.Version,
                 CustomAutoReplacements = [new AutoReplacementRule { Original = "ghbdtn", Corrected = "привет", Enabled = false }],
                 DecisionLog = [new DecisionLogItem { Original = "ghbdtn", Corrected = "привет", Reason = "test" }],
                 ConvertWordHotkey = new HotkeyBinding { Ctrl = true, Alt = false, Key = Keys.F8 },
@@ -1945,11 +1966,11 @@ internal sealed class SettingsForm : Form
             ColumnCount = 1,
         };
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 196));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 108));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 84));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 120));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 94));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 76));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         page.Controls.Add(layout);
 
@@ -1984,25 +2005,26 @@ internal sealed class SettingsForm : Form
         var optionGrid = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
-            ColumnCount = 2,
-            RowCount = 5,
+            ColumnCount = 3,
+            RowCount = 3,
         };
-        optionGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
-        optionGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
-        for (var row = 0; row < 5; row++)
+        optionGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.33F));
+        optionGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.33F));
+        optionGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.34F));
+        for (var row = 0; row < 3; row++)
         {
             optionGrid.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
         }
 
         optionGrid.Controls.Add(_autoSwitch, 0, 0);
         optionGrid.Controls.Add(_sound, 1, 0);
-        optionGrid.Controls.Add(_paused, 0, 1);
-        optionGrid.Controls.Add(_startup, 1, 1);
-        optionGrid.Controls.Add(_ignorePasswordFields, 0, 2);
-        optionGrid.Controls.Add(_aggressiveShortWords, 1, 2);
-        optionGrid.Controls.Add(_clipboardFallback, 0, 3);
-        optionGrid.Controls.Add(_autoHealKeyboardHook, 1, 3);
-        optionGrid.Controls.Add(_darkTheme, 0, 4);
+        optionGrid.Controls.Add(_paused, 2, 0);
+        optionGrid.Controls.Add(_startup, 0, 1);
+        optionGrid.Controls.Add(_ignorePasswordFields, 1, 1);
+        optionGrid.Controls.Add(_aggressiveShortWords, 2, 1);
+        optionGrid.Controls.Add(_clipboardFallback, 0, 2);
+        optionGrid.Controls.Add(_autoHealKeyboardHook, 1, 2);
+        optionGrid.Controls.Add(_darkTheme, 2, 2);
         layout.Controls.Add(optionGrid, 0, 1);
 
         var pauseButtons = new FlowLayoutPanel
@@ -2011,6 +2033,8 @@ internal sealed class SettingsForm : Form
             FlowDirection = FlowDirection.LeftToRight,
         };
         ConfigureButton(_pauseTwoMinutesButton, "Пауза на 2 минуты", 190);
+        _pauseTwoMinutesButton.Text = "Пауза 2 мин";
+        _pauseTwoMinutesButton.Width = 150;
         pauseButtons.Controls.Add(_pauseTwoMinutesButton);
         layout.Controls.Add(pauseButtons, 0, 2);
 
@@ -2159,7 +2183,7 @@ internal sealed class SettingsForm : Form
         AddHeader(layout, 0, "Исключённые процессы");
         AddHeader(layout, 1, "Русские слова");
         AddHeader(layout, 2, "Английские слова");
-        AddHeader(layout, 3, "Никогда не исправлять");
+        AddHeader(layout, 3, "Не исправлять");
         ConfigureTextArea(_excludedProcesses);
         ConfigureTextArea(_russianWords);
         ConfigureTextArea(_englishWords);
@@ -2179,6 +2203,7 @@ internal sealed class SettingsForm : Form
         excludeButtons.Controls.Add(_addActiveProcessButton);
         excludeButtons.Controls.Add(_pickProcessesButton);
         layout.Controls.Add(excludeButtons, 0, 2);
+        layout.SetColumnSpan(excludeButtons, 3);
 
         var save = new Button
         {
@@ -3127,6 +3152,7 @@ internal sealed class SettingsForm : Form
         button.Text = text;
         button.Width = width;
         button.Height = 36;
+        button.AutoEllipsis = true;
     }
 
     private static void ConfigureTextArea(TextBox textBox)
@@ -3168,6 +3194,7 @@ internal sealed class SettingsForm : Form
             Dock = DockStyle.Fill,
             Font = new Font("Segoe UI Semibold", 10F),
             ForeColor = Color.FromArgb(24, 32, 43),
+            AutoEllipsis = true,
         }, column, 0);
     }
 
@@ -3741,6 +3768,7 @@ internal sealed record AppSettings
     public bool DarkTheme { get; set; }
     public bool FirstRunHintShown { get; set; }
     public CorrectionProfile CorrectionProfile { get; set; } = CorrectionProfile.Balanced;
+    public int BuiltInReplacementsVersion { get; set; }
     public DateTime? LastUpdateCheckUtc { get; set; }
     public string EnToRuSound { get; set; } = SoundPlayerNames.Asterisk;
     public string RuToEnSound { get; set; } = SoundPlayerNames.Question;
@@ -3847,6 +3875,127 @@ internal sealed record AutoReplacementRule
     }
 }
 
+internal static class AutoReplacementDefaults
+{
+    public const int Version = 1;
+
+    private const string LatinKeys = "`qwertyuiop[]asdfghjkl;'zxcvbnm,./";
+    private const string CyrillicKeys = "ёйцукенгшщзхъфывапролджэячсмитьбю.";
+
+    private static readonly string[] RussianWords =
+    [
+        "привет", "пока", "спасибо", "пожалуйста", "да", "нет", "как", "что", "это",
+        "меня", "тебя", "тест", "текст", "код", "проект", "работа", "файл", "папка",
+        "пароль", "логин", "настройки", "ошибка", "исправить", "сделать", "отправить",
+        "сообщение", "документ", "таблица", "встреча", "задача", "список", "данные",
+        "сервер", "клиент", "браузер", "страница", "кнопка", "форма", "поиск", "ответ",
+        "вопрос", "пример", "команда", "сборка", "приложение", "раскладка", "русский",
+        "английский", "система", "слово", "замена", "звук", "назад", "вперед", "отмена",
+        "готово", "открыть", "закрыть", "сохранить", "удалить", "обновить", "скопировать",
+        "вставить", "адрес", "телефон", "номер", "город", "москва", "россия", "время",
+        "день", "ночь", "утро", "вечер", "хорошо", "плохо", "важно", "срочно", "проверка",
+        "решение", "проблема", "версия", "релиз", "коммит", "ветка", "репозиторий",
+        "программа", "утилита", "пользователь", "профиль", "запуск", "автозагрузка",
+        "скачать", "установить", "установка", "импорт", "экспорт", "горячие", "клавиши",
+        "клавиатура", "выделение", "буфер", "обмен", "копия", "подсказка", "инструкция",
+        "помощь", "раздел", "вкладка", "путь", "локально", "параметр", "проверить",
+        "собрать", "выпустить", "опубликовать", "скачивание", "фоновая", "быстро",
+        "медленно", "работает", "запущено", "установлено", "доступно", "найдено",
+        "ссылка", "понял", "давай", "нормально", "сейчас", "потом", "после", "перед",
+        "новый", "старый", "общий",
+    ];
+
+    private static readonly string[] EnglishWords =
+    [
+        "hello", "hi", "thanks", "thank", "please", "yes", "no", "this", "that", "what",
+        "when", "where", "why", "work", "project", "code", "test", "text", "window",
+        "site", "email", "file", "folder", "password", "login", "settings", "error",
+        "fix", "make", "send", "message", "document", "table", "calendar", "meeting",
+        "call", "task", "list", "data", "server", "client", "browser", "page", "button",
+        "form", "search", "answer", "question", "example", "command", "build", "application",
+        "app", "switcher", "layout", "russian", "english", "system", "auto", "word", "words",
+        "replace", "sound", "back", "forward", "undo", "ready", "start", "close", "open",
+        "save", "delete", "update", "copy", "paste", "admin", "address", "phone", "number",
+        "city", "time", "day", "night", "morning", "evening", "good", "bad", "important",
+        "urgent", "check", "solution", "problem", "version", "release", "commit", "branch",
+        "repository", "user", "name", "value", "key", "token", "api", "my", "me", "we",
+        "us", "it", "is", "am", "in", "on", "of", "to", "as", "at", "if", "do", "go",
+        "you", "not", "and", "but", "can", "may", "github", "windows", "keyboard", "shortcut",
+        "hotkey", "design", "program", "utility", "profile", "startup", "install", "installer",
+        "portable", "download", "upload", "import", "export", "json", "background", "silent",
+        "notification", "tray", "menu", "dialog", "selection", "clipboard", "configuration",
+        "config", "help", "hint", "guide", "first", "last", "new", "old", "current", "latest",
+        "available", "found", "path", "link", "normal", "now", "later", "before", "after", "next",
+    ];
+
+    public static List<AutoReplacementRule> Create()
+    {
+        var rules = new List<AutoReplacementRule>();
+        foreach (var word in RussianWords)
+        {
+            AddRule(rules, ConvertWithMap(word, CyrillicKeys, LatinKeys), word);
+        }
+
+        foreach (var word in EnglishWords)
+        {
+            AddRule(rules, ConvertWithMap(word, LatinKeys, CyrillicKeys), word);
+        }
+
+        return AutoReplacementRule.Normalize(rules);
+    }
+
+    public static void MergeInto(List<AutoReplacementRule> rules)
+    {
+        var existing = new HashSet<string>(rules.Select(rule => rule.Original), StringComparer.OrdinalIgnoreCase);
+        foreach (var rule in Create())
+        {
+            if (existing.Add(rule.Original))
+            {
+                rules.Add(rule);
+            }
+        }
+    }
+
+    private static void AddRule(List<AutoReplacementRule> rules, string original, string corrected)
+    {
+        if (string.Equals(original, corrected, StringComparison.OrdinalIgnoreCase)
+            || !AutoReplacementRule.IsValidText(original)
+            || !AutoReplacementRule.IsValidText(corrected))
+        {
+            return;
+        }
+
+        rules.Add(new AutoReplacementRule
+        {
+            Original = original,
+            Corrected = corrected,
+            Enabled = true,
+            Learned = false,
+            CreatedAt = DateTime.Now,
+        });
+    }
+
+    private static string ConvertWithMap(string text, string source, string target)
+    {
+        var builder = new StringBuilder(text.Length);
+        foreach (var ch in text)
+        {
+            var lower = char.ToLowerInvariant(ch);
+            var index = source.IndexOf(lower, StringComparison.Ordinal);
+            if (index < 0)
+            {
+                builder.Append(ch);
+                continue;
+            }
+
+            var converted = target[index];
+            builder.Append(char.IsUpper(ch) ? char.ToUpperInvariant(converted) : converted);
+        }
+
+        return builder.ToString();
+    }
+}
+
 internal sealed record CorrectionHistoryItem
 {
     public DateTime Timestamp { get; set; } = DateTime.Now;
@@ -3933,7 +4082,7 @@ internal static class SettingsStore
         {
             if (!File.Exists(SettingsPath))
             {
-                return new AppSettings();
+                return Normalize(new AppSettings());
             }
 
             var json = File.ReadAllText(SettingsPath, Encoding.UTF8);
@@ -3941,7 +4090,7 @@ internal static class SettingsStore
         }
         catch
         {
-            return new AppSettings();
+            return Normalize(new AppSettings());
         }
     }
 
@@ -4008,6 +4157,13 @@ internal static class SettingsStore
         settings.CustomEnglishWords = NormalizeList(settings.CustomEnglishWords);
         settings.CustomNeverCorrectWords = NormalizeList(settings.CustomNeverCorrectWords);
         settings.CustomAutoReplacements = AutoReplacementRule.Normalize(settings.CustomAutoReplacements);
+        if (settings.BuiltInReplacementsVersion < AutoReplacementDefaults.Version)
+        {
+            AutoReplacementDefaults.MergeInto(settings.CustomAutoReplacements);
+            settings.CustomAutoReplacements = AutoReplacementRule.Normalize(settings.CustomAutoReplacements);
+            settings.BuiltInReplacementsVersion = AutoReplacementDefaults.Version;
+        }
+
         settings.History = settings.History
             .Where(item => !string.IsNullOrWhiteSpace(item.Original) || !string.IsNullOrWhiteSpace(item.Corrected))
             .Take(30)
