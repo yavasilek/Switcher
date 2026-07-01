@@ -106,6 +106,8 @@ internal static class SelfTest
         CheckAuto(failures, "сщккшвщк", "corridor");
         CheckAuto(failures, "rjhbljhysq", "коридорный");
         CheckAuto(failures, "сщккшвщкы", "corridors");
+        CheckAuto(failures, "vfufpby", "магазин");
+        CheckAuto(failures, "вудшмукн", "delivery");
         CheckCustomAuto(failures);
         CheckExactAutoReplacement(failures);
         CheckTextConversion(failures, "ghbdtn vbh", "привет мир");
@@ -217,9 +219,14 @@ internal static class SelfTest
     private static void CheckDefaultReplacements(List<string> failures)
     {
         var rules = AutoReplacementDefaults.Create();
-        if (rules.Count < 120)
+        if (rules.Count < 700)
         {
-            failures.Add($"DEFAULT replacements: expected at least 120 rules, actual {rules.Count}");
+            failures.Add($"DEFAULT replacements: expected at least 700 rules, actual {rules.Count}");
+        }
+
+        if (BuiltInWordBase.RussianWords.Length < 250 || BuiltInWordBase.EnglishWords.Length < 250)
+        {
+            failures.Add($"WORD BASE size: expected at least 250+250 words, actual {BuiltInWordBase.RussianWords.Length}+{BuiltInWordBase.EnglishWords.Length}");
         }
 
         if (!rules.Any(rule => rule.Original == "ghbdtn" && rule.Corrected == "привет"))
@@ -230,6 +237,16 @@ internal static class SelfTest
         if (!rules.Any(rule => rule.Original == "руддщ" && rule.Corrected == "hello"))
         {
             failures.Add("DEFAULT replacements: missing руддщ -> hello");
+        }
+
+        if (!rules.Any(rule => rule.Original == "vfufpby" && rule.Corrected == "магазин"))
+        {
+            failures.Add("DEFAULT replacements: missing vfufpby -> магазин");
+        }
+
+        if (!rules.Any(rule => rule.Original == "вудшмукн" && rule.Corrected == "delivery"))
+        {
+            failures.Add("DEFAULT replacements: missing вудшмукн -> delivery");
         }
     }
 
@@ -4255,9 +4272,116 @@ internal sealed record AutoReplacementRule
     }
 }
 
+internal static class BuiltInWordBase
+{
+    public static readonly string[] RussianWords = ParseWordList(RussianRaw);
+    public static readonly string[] EnglishWords = ParseWordList(EnglishRaw);
+
+    private static string[] ParseWordList(string raw)
+    {
+        return raw
+            .Split([' ', '\r', '\n', '\t', ',', ';'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(word => word.Length > 0)
+            .Where(word => word.All(char.IsLetter))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private const string RussianRaw = """
+        а август августе автор автора авто автомобиль автомобиля адреса акция акции активный
+        алексей анализ англия английского английские английских апрель апреля архив банка банк
+        базе база базы баланс без безопасность белый белая билет билеты бизнес бизнеса близко
+        больше большой большая большие больших брал брать буду будем будет будете будешь будут
+        бывает быстро важно важная важные важных вариант варианты ваш ваша ваше ваши вашего
+        вашими введи ввести весь вещи вещь видео вид видимо видеть вижу вкладке включен включена
+        включить вместе вместо взял взять видно внимание внутри вода воды возможно возможность
+        возможности вопроса вопросы вот вообще время времени всем всеми всему вчера выбрать
+        выбора выбрал выгрузка выдать выйти выход выходит выше где сделал делаем делать дела
+        делах день деньги денег декабря дети директор документа документы должен должна должны
+        долго дома домой доступ доступа другой другая другие других думал думаю дальше дальше
+        ездить если есть еще жду ждет жизнь за заказ заказа заказы завтра загрузка загрузить
+        закрыто закрытый залить заменить заменил замену заново записать запись запуске запускать
+        запрос запроса запросы зачем звонить звонок звонка здесь здравствуйте зеленый значит
+        идея идеи идет идти из изменить изменения или именно иногда информация информации их
+        кабинет как какая какие каким какой какому карта карты касса кассы каталог качества
+        клиент клиента клиенты клиентов книга кнопку когда кодом кое комментарий комментарии
+        компания компании кому конец конечно контакт контакта контакты копировать короткий
+        короткие который которую которых кто куда купить купил курс курса лет летом либо лист
+        листа листы лицо логика лучше любые любой магазин магазина магазины май мало марта
+        материал материалы машина машины медленно место месяца месяц минут минута минуты много
+        может можете можешь мои мой можно мои мои монета москва нужно нужны нужен нужна новое
+        новой новых номером ночь ноября нормально новый новым новых надо назад название название
+        написать написал написала написали например начать начало недели неделя нельзя нету
+        ничего новый об обмена объект объекта обязательно обновления обычно один одна одной
+        одним окно окна онлайн оплатить оплата оплаты опять открыть открыт открыта открытые
+        отправка отправки отправил отправила отправить офисе ошибка ошибки очень пакет пароля
+        первый первая первые передать перевод перейти переход период письмо письма план плана
+        плохо по поводу поздно позже поиск поиска показать показал показать получить получено
+        получил получила получили полностью помочь понял понятна понятно порт портативный потом
+        почему почту почты права править правильно правило правила пред после последний
+        последнее последние посмотреть поставил поставить почти почта правда предыдущий привет
+        пример проверить проверил проверка проверки проверить проекте проекта проекты просьба
+        простой просто процесса процессы пункт пункты пусть путь пятница работа работы рабочий
+        рабочая рабочие рабочих раз раза разные разных раньше реально режим результата результат
+        результаты решить решение решения риск риска руб рублей русский русские русских рядом
+        сам сама сами сайт сайта сайты сегодня сейчас сказать сказал сказала сказали скачать
+        скрин скриншот следующий следующая следующие слишком слово словами случай случаи снова
+        сначала список списка списки спросить ссылка ссылки смотреть смог сможет смогу сначала
+        сообщение сообщения создать создал создать создали созвон спасибо способ способа способы
+        справа срок срока сроки сразу старый старая старые статус статуса столе стороны строка
+        строки суббота сумма суммы таблица таблицы так также такое такой такую там тема темы
+        теперь терминал терминала теста тесты текстовый текстовые телефон телефона тогда тоже
+        только товар товара товары точно точка точки три тут удалить удаление удалил удалили
+        уже указать указан указана указано утро файл файле файла файлы февраля фильтр форма
+        формы форум фото фотографии хорошо хочу хочешь хотим хотел хотела хотели хотя час часа
+        части часть чат чата через чисто чтобы что что-то четверг шаблон шаблона шапка школа
+        штук штуки экран экрана экспорт электронная элементы это этим этой этого январь ясно
+        явный язык языка языки
+        """;
+
+    private const string EnglishRaw = """
+        ability about above accept access account action active actually add address admin after
+        again against age agent ago agree ahead alert allow almost alone along already also always
+        amount analysis android answer anyone anything appear apply april area around ask asset
+        attach attempt august available avoid backup balance bank basic batch because become before
+        begin behind below best between bill billing bit black block blue body book branch bring
+        broken budget build builder business call called camera cancel cannot card case category
+        cause center change channel chat check checked checking child children choose city clear
+        click client close closed cloud color column comment comments common company complete
+        completed confirm connect connection contact content continue control convert copy correct
+        cost count country create created customer daily dark dashboard data database date debug
+        december default delete deleted delivery desktop detail details device dialog different
+        directory document done door download draft drive due during each early edit editor email
+        enable enabled end engine enough enter entry error event example exchange existing export
+        extra fail failed false family feature february field file filter final find finish fixed
+        flow folder follow footer force form format found friday friend full future general get
+        github given global going google green group guide half handle hard header help high hint
+        history home host hour hours however idea image import important improve include index
+        info input install installed installer issue item january job json july june keep keyboard
+        key kind kitchen known language last late later latest launch learn left level light line
+        link list local log login long look main manual march market master match matter maybe
+        meeting member menu message method microsoft minute missing mode monday money month more
+        morning most move name needed network never next night normal note notice november number
+        object october offer office offline online open opened option order output owner package
+        page paid panel parameter parent password paste path payment pending people percent phone
+        pick picture place plan please point popup portable possible power prepare preview price
+        primary problem process product profile program progress project prompt public publish
+        pull push query quick ready reason receive recent record red release reload remove report
+        request reset result retry review right risk room rule run running save screen screenshot
+        search second section select selected send sent september server service set setting setup
+        share sheet short shortcut should show shown simple since site size slow small source space
+        start started state status step still stop store street string strong student style subject
+        success summary sunday support switch system table tab target task team template terminal
+        test text theme thing ticket time title today token tomorrow tool total train try tuesday
+        type typed update updated upload urgent user value version view visible wait waiting want
+        warning water wednesday week weekend white window windows word words work workflow working
+        wrong year yellow yesterday
+        """;
+}
+
 internal static class AutoReplacementDefaults
 {
-    public const int Version = 2;
+    public const int Version = 3;
 
     private const string LatinKeys = "`qwertyuiop[]asdfghjkl;'zxcvbnm,./";
     private const string CyrillicKeys = "ёйцукенгшщзхъфывапролджэячсмитьбю.";
@@ -4324,12 +4448,12 @@ internal static class AutoReplacementDefaults
     public static List<AutoReplacementRule> Create()
     {
         var rules = new List<AutoReplacementRule>();
-        foreach (var word in RussianWords)
+        foreach (var word in RussianWords.Concat(BuiltInWordBase.RussianWords))
         {
             AddRule(rules, ConvertWithMap(word, CyrillicKeys, LatinKeys), word);
         }
 
-        foreach (var word in EnglishWords)
+        foreach (var word in EnglishWords.Concat(BuiltInWordBase.EnglishWords))
         {
             AddRule(rules, ConvertWithMap(word, LatinKeys, CyrillicKeys), word);
         }
@@ -5228,7 +5352,7 @@ internal static class TextHeuristics
     private static readonly Dictionary<char, char> LatinToCyrillic = BuildLatinToCyrillic();
     private static readonly Dictionary<char, char> CyrillicToLatin = LatinToCyrillic.ToDictionary(pair => pair.Value, pair => pair.Key);
 
-    private static readonly HashSet<string> RussianWords = new(StringComparer.OrdinalIgnoreCase)
+    private static readonly HashSet<string> RussianWords = new(BuiltInWordBase.RussianWords, StringComparer.OrdinalIgnoreCase)
     {
         "привет", "пока", "спасибо", "пожалуйста", "да", "нет", "как", "что", "это", "этот",
         "эта", "эти", "там", "тут", "здесь", "меня", "тебя", "если", "или", "для",
@@ -5265,7 +5389,7 @@ internal static class TextHeuristics
         "неправильно", "дальше", "лучше", "хуже", "главное", "обычный", "частый",
     };
 
-    private static readonly HashSet<string> EnglishWords = new(StringComparer.OrdinalIgnoreCase)
+    private static readonly HashSet<string> EnglishWords = new(BuiltInWordBase.EnglishWords, StringComparer.OrdinalIgnoreCase)
     {
         "hello", "thanks", "thank", "please", "yes", "no", "the", "this", "that", "there",
         "here", "what", "when", "where", "why", "with", "without", "for", "from", "about",
