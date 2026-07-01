@@ -632,7 +632,7 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         }
     }
 
-    private void ShowSettings()
+    private SettingsForm ShowSettings()
     {
         if (_settingsForm is { IsDisposed: false })
         {
@@ -643,12 +643,13 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
 
             _settingsForm.Show();
             _settingsForm.Activate();
-            return;
+            return _settingsForm;
         }
 
         _settingsForm = new SettingsForm(this);
         _settingsForm.FormClosed += (_, _) => _settingsForm = null;
         _settingsForm.Show();
+        return _settingsForm;
     }
 
     private bool HandleKeyDown(Keys key, int scanCode)
@@ -1224,7 +1225,8 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
                 return;
             }
 
-            ShowSettings();
+            var settingsForm = ShowSettings();
+            settingsForm.ShowInstallTab();
             updateWindowShown = true;
             _settingsForm?.BeginUpdateInstall($"Скачиваю {update.TagName}...");
 
@@ -1641,6 +1643,8 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
 internal sealed class SettingsForm : Form
 {
     private readonly SwitcherApplicationContext _context;
+    private readonly TabControl _tabs = new();
+    private TabPage? _installTab;
     private readonly Label _statusLabel = new();
     private readonly Label _lastActionLabel = new();
     private readonly CheckBox _autoSwitch = new();
@@ -1733,20 +1737,17 @@ internal sealed class SettingsForm : Form
         _statusLabel.ForeColor = Color.FromArgb(71, 85, 105);
         root.Controls.Add(_statusLabel, 0, 1);
 
-        var tabs = new TabControl
-        {
-            Dock = DockStyle.Fill,
-            Multiline = true,
-        };
-        tabs.TabPages.Add(CreateGeneralTab());
-        tabs.TabPages.Add(CreateListsTab());
-        tabs.TabPages.Add(CreateReplacementsTab());
-        tabs.TabPages.Add(CreateSettingsTab());
-        tabs.TabPages.Add(CreateDecisionLogTab());
-        tabs.TabPages.Add(CreateHistoryTab());
-        tabs.TabPages.Add(CreateDiagnosticsTab());
-        tabs.TabPages.Add(CreateInstallTab());
-        root.Controls.Add(tabs, 0, 2);
+        _tabs.Dock = DockStyle.Fill;
+        _tabs.Multiline = true;
+        _tabs.TabPages.Add(CreateGeneralTab());
+        _tabs.TabPages.Add(CreateListsTab());
+        _tabs.TabPages.Add(CreateReplacementsTab());
+        _tabs.TabPages.Add(CreateSettingsTab());
+        _tabs.TabPages.Add(CreateDecisionLogTab());
+        _tabs.TabPages.Add(CreateHistoryTab());
+        _tabs.TabPages.Add(CreateDiagnosticsTab());
+        _tabs.TabPages.Add(CreateInstallTab());
+        root.Controls.Add(_tabs, 0, 2);
 
         var buttons = new FlowLayoutPanel
         {
@@ -1802,6 +1803,28 @@ internal sealed class SettingsForm : Form
         RefreshDiagnostics();
         RefreshInstallState();
         ApplyTheme();
+    }
+
+    public void ShowInstallTab()
+    {
+        if (InvokeRequired)
+        {
+            BeginInvoke(ShowInstallTab);
+            return;
+        }
+
+        if (_installTab is not null)
+        {
+            _tabs.SelectedTab = _installTab;
+        }
+
+        if (WindowState == FormWindowState.Minimized)
+        {
+            WindowState = FormWindowState.Normal;
+        }
+
+        Show();
+        Activate();
     }
 
     public void RefreshReplacementRules()
@@ -2328,6 +2351,7 @@ internal sealed class SettingsForm : Form
     private TabPage CreateInstallTab()
     {
         var page = new TabPage("Установка");
+        _installTab = page;
         var layout = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
@@ -2855,6 +2879,7 @@ internal sealed class SettingsForm : Form
             return;
         }
 
+        ShowInstallTab();
         _installingUpdate = true;
         _updateStatus.Text = status;
         _updateProgress.Visible = true;
