@@ -110,6 +110,7 @@ internal static class SelfTest
         CheckNeverCorrect(failures);
         CheckDefaultReplacements(failures);
         CheckSettingsRoundTrip(failures);
+        CheckListImportParser(failures);
         CheckInputSize(failures);
         CheckDownloadProgress(failures);
 
@@ -306,6 +307,22 @@ internal static class SelfTest
             {
                 // Best effort cleanup for self-test temp file.
             }
+        }
+    }
+
+    private static void CheckListImportParser(List<string> failures)
+    {
+        var imported = ListImportParser.Parse("""
+            # comment
+            привет
+            hello;world
+            terminal.exe,cmd
+            // skip
+            привет
+            """);
+        if (!imported.SequenceEqual(["привет", "hello", "world", "terminal.exe", "cmd"], StringComparer.OrdinalIgnoreCase))
+        {
+            failures.Add($"LIST import: unexpected result {string.Join(", ", imported)}");
         }
     }
 
@@ -1695,12 +1712,15 @@ internal sealed class SettingsForm : Form
     private readonly TextBox _diagnostics = new();
     private readonly ListBox _history = new();
     private readonly ListBox _decisionLog = new();
+    private readonly TextBox _decisionSearch = new();
+    private readonly ComboBox _decisionFilter = new();
     private readonly Label _installStatus = new();
     private readonly Label _updateStatus = new();
     private readonly ProgressBar _updateProgress = new();
     private readonly Button _pauseTwoMinutesButton = new();
     private readonly Button _addActiveProcessButton = new();
     private readonly Button _pickProcessesButton = new();
+    private readonly Button _importListsButton = new();
     private readonly Button _installButton = new();
     private readonly Button _uninstallButton = new();
     private readonly Button _checkUpdateButton = new();
@@ -1713,6 +1733,7 @@ internal sealed class SettingsForm : Form
     private readonly Button _alwaysCorrectDecisionButton = new();
     private readonly Button _neverCorrectDecisionButton = new();
     private readonly Button _clearDecisionLogButton = new();
+    private readonly Button _clearDecisionFilterButton = new();
     private readonly Button _refreshDiagnosticsButton = new();
     private readonly Button _reinstallHookButton = new();
     private readonly Button _exportSettingsButton = new();
@@ -1910,13 +1931,55 @@ internal sealed class SettingsForm : Form
 
         _decisionLog.BeginUpdate();
         _decisionLog.Items.Clear();
-        foreach (var item in _context.DecisionLog)
+        foreach (var item in FilterDecisionLog(_context.DecisionLog))
         {
             _decisionLog.Items.Add(item);
         }
 
         _decisionLog.EndUpdate();
         UpdateDecisionButtons();
+    }
+
+    private IEnumerable<DecisionLogItem> FilterDecisionLog(IEnumerable<DecisionLogItem> items)
+    {
+        var query = _decisionSearch.Text.Trim();
+        var filter = _decisionFilter.SelectedItem as string ?? "Все";
+        foreach (var item in items)
+        {
+            if (!MatchesDecisionFilter(item, filter))
+            {
+                continue;
+            }
+
+            if (query.Length > 0 && !MatchesDecisionSearch(item, query))
+            {
+                continue;
+            }
+
+            yield return item;
+        }
+    }
+
+    private static bool MatchesDecisionFilter(DecisionLogItem item, string filter)
+    {
+        return filter switch
+        {
+            "Исправлено" => item.Applied,
+            "Пропущено" => !item.Applied,
+            "Авто" => item.Kind.Contains("авто", StringComparison.OrdinalIgnoreCase),
+            "Ручная" => item.Kind.Contains("руч", StringComparison.OrdinalIgnoreCase),
+            "Выделение" => item.Kind.Contains("выдел", StringComparison.OrdinalIgnoreCase),
+            _ => true,
+        };
+    }
+
+    private static bool MatchesDecisionSearch(DecisionLogItem item, string query)
+    {
+        return item.Original.Contains(query, StringComparison.OrdinalIgnoreCase)
+            || item.Corrected.Contains(query, StringComparison.OrdinalIgnoreCase)
+            || item.Reason.Contains(query, StringComparison.OrdinalIgnoreCase)
+            || item.Kind.Contains(query, StringComparison.OrdinalIgnoreCase)
+            || item.ToString().Contains(query, StringComparison.OrdinalIgnoreCase);
     }
 
     public void SetLastAction(string text)
@@ -2200,8 +2263,10 @@ internal sealed class SettingsForm : Form
         };
         ConfigureButton(_addActiveProcessButton, "Добавить активное", 180);
         ConfigureButton(_pickProcessesButton, "Выбрать процессы", 180);
+        ConfigureButton(_importListsButton, "Импорт TXT/CSV", 160);
         excludeButtons.Controls.Add(_addActiveProcessButton);
         excludeButtons.Controls.Add(_pickProcessesButton);
+        excludeButtons.Controls.Add(_importListsButton);
         layout.Controls.Add(excludeButtons, 0, 2);
         layout.SetColumnSpan(excludeButtons, 3);
 
@@ -2278,10 +2343,11 @@ internal sealed class SettingsForm : Form
         {
             Dock = DockStyle.Fill,
             Padding = new Padding(14),
-            RowCount = 3,
+            RowCount = 4,
             ColumnCount = 1,
         };
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 52));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 46));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
         page.Controls.Add(layout);
@@ -2293,9 +2359,49 @@ internal sealed class SettingsForm : Form
             ForeColor = Color.FromArgb(71, 85, 105),
         }, 0, 0);
 
+        var filterBar = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 5,
+            RowCount = 1,
+        };
+        filterBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 58));
+        filterBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        filterBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 82));
+        filterBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 170));
+        filterBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 112));
+        filterBar.Controls.Add(new Label
+        {
+            Text = "Поиск",
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+        }, 0, 0);
+        _decisionSearch.Dock = DockStyle.Fill;
+        _decisionSearch.PlaceholderText = "слово, причина или тип";
+        filterBar.Controls.Add(_decisionSearch, 1, 0);
+        filterBar.Controls.Add(new Label
+        {
+            Text = "Показать",
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+        }, 2, 0);
+        _decisionFilter.Dock = DockStyle.Fill;
+        _decisionFilter.DropDownStyle = ComboBoxStyle.DropDownList;
+        if (_decisionFilter.Items.Count == 0)
+        {
+            _decisionFilter.Items.AddRange(["Все", "Исправлено", "Пропущено", "Авто", "Ручная", "Выделение"]);
+            _decisionFilter.SelectedIndex = 0;
+        }
+
+        filterBar.Controls.Add(_decisionFilter, 3, 0);
+        ConfigureButton(_clearDecisionFilterButton, "Сброс", 100);
+        _clearDecisionFilterButton.Dock = DockStyle.Fill;
+        filterBar.Controls.Add(_clearDecisionFilterButton, 4, 0);
+        layout.Controls.Add(filterBar, 0, 1);
+
         _decisionLog.Dock = DockStyle.Fill;
         _decisionLog.HorizontalScrollbar = true;
-        layout.Controls.Add(_decisionLog, 0, 1);
+        layout.Controls.Add(_decisionLog, 0, 2);
 
         var buttons = new FlowLayoutPanel
         {
@@ -2308,7 +2414,7 @@ internal sealed class SettingsForm : Form
         buttons.Controls.Add(_alwaysCorrectDecisionButton);
         buttons.Controls.Add(_neverCorrectDecisionButton);
         buttons.Controls.Add(_clearDecisionLogButton);
-        layout.Controls.Add(buttons, 0, 2);
+        layout.Controls.Add(buttons, 0, 3);
         return page;
     }
 
@@ -2570,6 +2676,7 @@ internal sealed class SettingsForm : Form
         _pauseTwoMinutesButton.Click += (_, _) => _context.PauseTemporarily(TimeSpan.FromMinutes(2));
         _addActiveProcessButton.Click += (_, _) => AddActiveProcessToExclusions();
         _pickProcessesButton.Click += (_, _) => PickProcessesForExclusions();
+        _importListsButton.Click += (_, _) => ImportListFromTextFiles();
         _installButton.Click += (_, _) =>
         {
             _context.InstallToSystem();
@@ -2597,6 +2704,14 @@ internal sealed class SettingsForm : Form
         _deleteReplacementButton.Click += (_, _) => DeleteSelectedReplacements();
         _clearLearnedReplacementsButton.Click += (_, _) => ClearLearnedReplacements();
         _decisionLog.SelectedIndexChanged += (_, _) => UpdateDecisionButtons();
+        _decisionSearch.TextChanged += (_, _) => RefreshDecisionLog();
+        _decisionFilter.SelectedIndexChanged += (_, _) => RefreshDecisionLog();
+        _clearDecisionFilterButton.Click += (_, _) =>
+        {
+            _decisionSearch.Clear();
+            _decisionFilter.SelectedIndex = 0;
+            RefreshDecisionLog();
+        };
         _alwaysCorrectDecisionButton.Click += (_, _) => AddSelectedDecisionReplacement();
         _neverCorrectDecisionButton.Click += (_, _) => AddSelectedDecisionNeverCorrect();
         _clearDecisionLogButton.Click += (_, _) => _context.ClearDecisionLog();
@@ -2765,6 +2880,114 @@ internal sealed class SettingsForm : Form
 
         _context.AddProcessesToExclusions(dialog.SelectedProcessNames);
         _excludedProcesses.Text = LinesFrom(_context.Settings.ExcludedProcesses);
+    }
+
+    private void ImportListFromTextFiles()
+    {
+        using var targetDialog = new ListImportTargetDialog(_context.Settings.DarkTheme);
+        if (targetDialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        using var dialog = new OpenFileDialog
+        {
+            Title = "Импорт списка Switcher",
+            Filter = "Текстовые файлы (*.txt;*.csv)|*.txt;*.csv|Все файлы (*.*)|*.*",
+            CheckFileExists = true,
+            Multiselect = true,
+        };
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        try
+        {
+            var parsed = new List<string>();
+            foreach (var fileName in dialog.FileNames)
+            {
+                parsed.AddRange(ListImportParser.Parse(File.ReadAllText(fileName, Encoding.UTF8)));
+            }
+
+            var validCandidates = parsed
+                .Where(IsValidListItem)
+                .ToList();
+            var valid = validCandidates
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            var invalid = parsed.Count - validCandidates.Count;
+            var duplicates = validCandidates.Count - valid.Count;
+            var textBox = GetImportTargetTextBox(targetDialog.Target);
+            var added = AppendImportedLines(textBox, valid);
+            SaveLists();
+
+            var message = $"Импортировано: {added}. Уже было: {valid.Count - added}.";
+            if (duplicates > 0)
+            {
+                message += $"\r\nДубли в файлах: {duplicates}.";
+            }
+
+            if (invalid > 0)
+            {
+                message += $"\r\nПропущено строк с пробелами или слишком длинных: {invalid}.";
+            }
+
+            MessageBox.Show(this, message, GetImportTargetName(targetDialog.Target), MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, $"Не удалось импортировать список:\r\n{ex.Message}", "Switcher", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    private TextBox GetImportTargetTextBox(ListImportTarget target)
+    {
+        return target switch
+        {
+            ListImportTarget.ExcludedProcesses => _excludedProcesses,
+            ListImportTarget.RussianWords => _russianWords,
+            ListImportTarget.EnglishWords => _englishWords,
+            ListImportTarget.NeverCorrectWords => _neverCorrectWords,
+            _ => _neverCorrectWords,
+        };
+    }
+
+    private static string GetImportTargetName(ListImportTarget target)
+    {
+        return target switch
+        {
+            ListImportTarget.ExcludedProcesses => "Исключённые процессы",
+            ListImportTarget.RussianWords => "Русские слова",
+            ListImportTarget.EnglishWords => "Английские слова",
+            ListImportTarget.NeverCorrectWords => "Не исправлять",
+            _ => "Список",
+        };
+    }
+
+    private static int AppendImportedLines(TextBox textBox, IEnumerable<string> values)
+    {
+        var merged = ParseLines(textBox.Text);
+        var existing = new HashSet<string>(merged, StringComparer.OrdinalIgnoreCase);
+        var added = 0;
+        foreach (var value in values)
+        {
+            if (!existing.Add(value))
+            {
+                continue;
+            }
+
+            merged.Add(value);
+            added++;
+        }
+
+        textBox.Text = LinesFrom(merged);
+        return added;
+    }
+
+    private static bool IsValidListItem(string value)
+    {
+        return value.Length is > 0 and <= 128 && !value.Any(char.IsWhiteSpace);
     }
 
     private void UpdateDecisionButtons()
@@ -3348,6 +3571,114 @@ internal sealed class SettingsForm : Form
     }
 
     private sealed record ProfileOption(CorrectionProfile Profile, string Text)
+    {
+        public override string ToString()
+        {
+            return Text;
+        }
+    }
+}
+
+internal enum ListImportTarget
+{
+    ExcludedProcesses,
+    RussianWords,
+    EnglishWords,
+    NeverCorrectWords,
+}
+
+internal sealed class ListImportTargetDialog : Form
+{
+    private readonly ComboBox _target = new();
+
+    public ListImportTarget Target => _target.SelectedItem is TargetOption option
+        ? option.Target
+        : ListImportTarget.NeverCorrectWords;
+
+    public ListImportTargetDialog(bool darkTheme)
+    {
+        Text = "Импорт списка";
+        StartPosition = FormStartPosition.CenterParent;
+        AutoScaleMode = AutoScaleMode.Dpi;
+        MinimumSize = new Size(420, 210);
+        ClientSize = new Size(460, 220);
+        Font = new Font("Segoe UI", 10F);
+
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            Padding = new Padding(16),
+            RowCount = 3,
+            ColumnCount = 1,
+        };
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 56));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        Controls.Add(root);
+
+        root.Controls.Add(new Label
+        {
+            Text = "Куда добавить строки из файла?",
+            Dock = DockStyle.Fill,
+            ForeColor = Color.FromArgb(71, 85, 105),
+        }, 0, 0);
+
+        _target.Dock = DockStyle.Fill;
+        _target.DropDownStyle = ComboBoxStyle.DropDownList;
+        _target.Items.AddRange(
+        [
+            new TargetOption(ListImportTarget.ExcludedProcesses, "Исключённые процессы"),
+            new TargetOption(ListImportTarget.RussianWords, "Русские слова"),
+            new TargetOption(ListImportTarget.EnglishWords, "Английские слова"),
+            new TargetOption(ListImportTarget.NeverCorrectWords, "Не исправлять"),
+        ]);
+        _target.SelectedIndex = 0;
+        root.Controls.Add(_target, 0, 1);
+
+        var buttons = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.RightToLeft,
+        };
+        var ok = new Button
+        {
+            Text = "Импортировать",
+            DialogResult = DialogResult.OK,
+            Width = 150,
+            Height = 36,
+            AutoEllipsis = true,
+        };
+        var cancel = new Button
+        {
+            Text = "Отмена",
+            DialogResult = DialogResult.Cancel,
+            Width = 110,
+            Height = 36,
+            AutoEllipsis = true,
+        };
+        buttons.Controls.Add(ok);
+        buttons.Controls.Add(cancel);
+        root.Controls.Add(buttons, 0, 2);
+
+        AcceptButton = ok;
+        CancelButton = cancel;
+        ApplyTheme(this, darkTheme);
+    }
+
+    private static void ApplyTheme(Control control, bool darkTheme)
+    {
+        var back = darkTheme ? Color.FromArgb(15, 23, 42) : Color.FromArgb(247, 249, 252);
+        var surface = darkTheme ? Color.FromArgb(30, 41, 59) : Color.White;
+        var text = darkTheme ? Color.FromArgb(226, 232, 240) : Color.FromArgb(24, 32, 43);
+        control.BackColor = control is TextBox or ComboBox or Button ? surface : back;
+        control.ForeColor = text;
+        foreach (Control child in control.Controls)
+        {
+            ApplyTheme(child, darkTheme);
+        }
+    }
+
+    private sealed record TargetOption(ListImportTarget Target, string Text)
     {
         public override string ToString()
         {
@@ -4025,6 +4356,31 @@ internal sealed record DecisionLogItem
             ? Original
             : $"{Original} -> {Corrected}";
         return $"{Timestamp:HH:mm:ss} {Kind} ({action}): {pair}. {Reason}";
+    }
+}
+
+internal static class ListImportParser
+{
+    private static readonly char[] Separators = ['\r', '\n', '\t', ',', ';'];
+
+    public static List<string> Parse(string text)
+    {
+        return text
+            .Split(Separators, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(RemoveComment)
+            .Select(value => value.Trim())
+            .Where(value => value.Length > 0)
+            .Where(value => !value.StartsWith('#') && !value.StartsWith("//", StringComparison.Ordinal))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static string RemoveComment(string value)
+    {
+        var hashIndex = value.IndexOf('#');
+        var slashIndex = value.IndexOf("//", StringComparison.Ordinal);
+        var index = hashIndex < 0 ? slashIndex : slashIndex < 0 ? hashIndex : Math.Min(hashIndex, slashIndex);
+        return index < 0 ? value : value[..index];
     }
 }
 
