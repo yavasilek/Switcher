@@ -110,6 +110,7 @@ internal static class SelfTest
         CheckNeverCorrect(failures);
         CheckSettingsRoundTrip(failures);
         CheckInputSize(failures);
+        CheckDownloadProgress(failures);
 
         if (failures.Count == 0)
         {
@@ -277,6 +278,21 @@ internal static class SelfTest
         if (actual != expected)
         {
             failures.Add($"INPUT size: expected {expected}, actual {actual}");
+        }
+    }
+
+    private static void CheckDownloadProgress(List<string> failures)
+    {
+        var half = new DownloadProgress(50, 100);
+        if (half.Percent != 50 || !half.StatusText.Contains("50%", StringComparison.Ordinal))
+        {
+            failures.Add($"PROGRESS half: expected 50%, actual {half.Percent} / {half.StatusText}");
+        }
+
+        var unknown = new DownloadProgress(2048, null);
+        if (unknown.Percent is not null || !unknown.StatusText.Contains("KB", StringComparison.Ordinal))
+        {
+            failures.Add($"PROGRESS unknown: expected KB text, actual {unknown.Percent} / {unknown.StatusText}");
         }
     }
 }
@@ -584,6 +600,12 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
     {
         if (_settingsForm is { IsDisposed: false })
         {
+            if (_settingsForm.WindowState == FormWindowState.Minimized)
+            {
+                _settingsForm.WindowState = FormWindowState.Normal;
+            }
+
+            _settingsForm.Show();
             _settingsForm.Activate();
             return;
         }
@@ -1033,6 +1055,7 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
 
     public async Task InstallUpdateAsync(UpdateInfo update)
     {
+        var updateWindowShown = false;
         try
         {
             var result = MessageBox.Show(
@@ -1045,12 +1068,27 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
                 return;
             }
 
-            var downloadedExe = await UpdateManager.DownloadUpdateAsync(update);
+            ShowSettings();
+            updateWindowShown = true;
+            _settingsForm?.BeginUpdateInstall($"Скачиваю {update.TagName}...");
+
+            var progress = new Progress<DownloadProgress>(value =>
+            {
+                _settingsForm?.ReportUpdateProgress(value);
+            });
+
+            var downloadedExe = await UpdateManager.DownloadUpdateAsync(update, progress);
+            _settingsForm?.CompleteUpdateInstall("Скачано. Готовлю замену и перезапуск...", keepBusy: true);
             InstallManager.ScheduleReplacement(downloadedExe, Application.ExecutablePath, Environment.ProcessId);
             ExitThread();
         }
         catch (Exception ex)
         {
+            if (updateWindowShown)
+            {
+                _settingsForm?.CompleteUpdateInstall("Не удалось установить обновление.", keepBusy: false);
+            }
+
             MessageBox.Show($"Не удалось установить обновление:\r\n{ex.Message}", "Switcher", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
@@ -1383,6 +1421,7 @@ internal sealed class SettingsForm : Form
     private readonly ListBox _history = new();
     private readonly Label _installStatus = new();
     private readonly Label _updateStatus = new();
+    private readonly ProgressBar _updateProgress = new();
     private readonly Button _installButton = new();
     private readonly Button _uninstallButton = new();
     private readonly Button _checkUpdateButton = new();
@@ -1398,6 +1437,7 @@ internal sealed class SettingsForm : Form
     private readonly Button _showFirstRunHintButton = new();
     private UpdateInfo? _latestUpdate;
     private bool _updating;
+    private bool _installingUpdate;
 
     public SettingsForm(SwitcherApplicationContext context)
     {
@@ -1911,7 +1951,7 @@ internal sealed class SettingsForm : Form
         {
             Dock = DockStyle.Fill,
             Padding = new Padding(14),
-            RowCount = 9,
+            RowCount = 10,
             ColumnCount = 1,
         };
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
@@ -1919,9 +1959,10 @@ internal sealed class SettingsForm : Form
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 76));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 58));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 72));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 88));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         page.Controls.Add(layout);
 
@@ -1963,6 +2004,14 @@ internal sealed class SettingsForm : Form
         _updateStatus.AutoEllipsis = false;
         layout.Controls.Add(_updateStatus, 0, 5);
 
+        _updateProgress.Dock = DockStyle.Fill;
+        _updateProgress.Minimum = 0;
+        _updateProgress.Maximum = 100;
+        _updateProgress.Style = ProgressBarStyle.Continuous;
+        _updateProgress.Visible = false;
+        _updateProgress.Margin = new Padding(0, 6, 0, 6);
+        layout.Controls.Add(_updateProgress, 0, 6);
+
         var updateButtons = new FlowLayoutPanel
         {
             Dock = DockStyle.Fill,
@@ -1973,14 +2022,14 @@ internal sealed class SettingsForm : Form
         _installUpdateButton.Enabled = false;
         updateButtons.Controls.Add(_checkUpdateButton);
         updateButtons.Controls.Add(_installUpdateButton);
-        layout.Controls.Add(updateButtons, 0, 6);
+        layout.Controls.Add(updateButtons, 0, 7);
 
         layout.Controls.Add(new Label
         {
             Text = "Установка выполняется без прав администратора в профиль пользователя. Обновление скачивает последний Switcher.exe из GitHub Releases и заменяет текущий файл после закрытия приложения.",
             Dock = DockStyle.Fill,
             ForeColor = Color.FromArgb(71, 85, 105),
-        }, 0, 7);
+        }, 0, 8);
 
         return page;
     }
@@ -2285,7 +2334,91 @@ internal sealed class SettingsForm : Form
         _installStatus.Text = _context.InstallationStatus;
         _installButton.Enabled = !InstallManager.IsCurrentInstanceInstalled;
         _uninstallButton.Enabled = InstallManager.IsInstalled;
+        if (_installingUpdate)
+        {
+            return;
+        }
+
+        _updateProgress.Visible = false;
+        _updateProgress.Value = 0;
+        _updateProgress.Style = ProgressBarStyle.Continuous;
+        _updateProgress.MarqueeAnimationSpeed = 0;
         _updateStatus.Text = BuildUpdateStatusText();
+        _checkUpdateButton.Enabled = true;
+        _installUpdateButton.Enabled = _latestUpdate?.IsNewer == true;
+    }
+
+    public void BeginUpdateInstall(string status)
+    {
+        if (InvokeRequired)
+        {
+            BeginInvoke(new Action(() => BeginUpdateInstall(status)));
+            return;
+        }
+
+        _installingUpdate = true;
+        _updateStatus.Text = status;
+        _updateProgress.Visible = true;
+        _updateProgress.Style = ProgressBarStyle.Marquee;
+        _updateProgress.MarqueeAnimationSpeed = 30;
+        _updateProgress.Value = 0;
+        _checkUpdateButton.Enabled = false;
+        _installUpdateButton.Enabled = false;
+    }
+
+    public void ReportUpdateProgress(DownloadProgress progress)
+    {
+        if (InvokeRequired)
+        {
+            BeginInvoke(new Action(() => ReportUpdateProgress(progress)));
+            return;
+        }
+
+        _installingUpdate = true;
+        _updateProgress.Visible = true;
+        if (progress.Percent is { } percent)
+        {
+            _updateProgress.Style = ProgressBarStyle.Continuous;
+            _updateProgress.MarqueeAnimationSpeed = 0;
+            _updateProgress.Value = Math.Clamp(percent, _updateProgress.Minimum, _updateProgress.Maximum);
+        }
+        else
+        {
+            _updateProgress.Style = ProgressBarStyle.Marquee;
+            _updateProgress.MarqueeAnimationSpeed = 30;
+        }
+
+        _updateStatus.Text = $"Скачиваю обновление: {progress.StatusText}";
+        _checkUpdateButton.Enabled = false;
+        _installUpdateButton.Enabled = false;
+    }
+
+    public void CompleteUpdateInstall(string status, bool keepBusy)
+    {
+        if (InvokeRequired)
+        {
+            BeginInvoke(new Action(() => CompleteUpdateInstall(status, keepBusy)));
+            return;
+        }
+
+        _updateStatus.Text = status;
+        if (keepBusy)
+        {
+            _updateProgress.Visible = true;
+            _updateProgress.Style = ProgressBarStyle.Continuous;
+            _updateProgress.MarqueeAnimationSpeed = 0;
+            _updateProgress.Value = _updateProgress.Maximum;
+            _checkUpdateButton.Enabled = false;
+            _installUpdateButton.Enabled = false;
+            return;
+        }
+
+        _installingUpdate = false;
+        _updateProgress.Visible = false;
+        _updateProgress.Style = ProgressBarStyle.Continuous;
+        _updateProgress.MarqueeAnimationSpeed = 0;
+        _updateProgress.Value = 0;
+        _checkUpdateButton.Enabled = true;
         _installUpdateButton.Enabled = _latestUpdate?.IsNewer == true;
     }
 
@@ -2305,8 +2438,16 @@ internal sealed class SettingsForm : Form
 
     private async Task CheckUpdatesFromFormAsync()
     {
+        if (_installingUpdate)
+        {
+            return;
+        }
+
         _checkUpdateButton.Enabled = false;
         _installUpdateButton.Enabled = false;
+        _updateProgress.Visible = true;
+        _updateProgress.Style = ProgressBarStyle.Marquee;
+        _updateProgress.MarqueeAnimationSpeed = 30;
         _updateStatus.Text = "Проверяю GitHub Releases...";
         try
         {
@@ -3278,6 +3419,40 @@ internal sealed record UpdateInfo(
     long Size,
     bool IsNewer);
 
+internal sealed record DownloadProgress(long BytesReceived, long? TotalBytes)
+{
+    public int? Percent => TotalBytes is > 0
+        ? (int)Math.Clamp(BytesReceived * 100 / TotalBytes.Value, 0, 100)
+        : null;
+
+    public string StatusText
+    {
+        get
+        {
+            var received = FormatBytes(BytesReceived);
+            return TotalBytes is > 0
+                ? $"{Percent ?? 0}% ({received} из {FormatBytes(TotalBytes.Value)})"
+                : received;
+        }
+    }
+
+    private static string FormatBytes(long bytes)
+    {
+        string[] units = ["B", "KB", "MB", "GB"];
+        var value = (double)Math.Max(0, bytes);
+        var unit = 0;
+        while (value >= 1024 && unit < units.Length - 1)
+        {
+            value /= 1024;
+            unit++;
+        }
+
+        return unit == 0
+            ? $"{value:0} {units[unit]}"
+            : $"{value:0.0} {units[unit]}";
+    }
+}
+
 internal static class UpdateManager
 {
     public static async Task<UpdateInfo> CheckLatestAsync(CancellationToken cancellationToken = default)
@@ -3322,15 +3497,39 @@ internal static class UpdateManager
             latestVersion > ApplicationInfo.CurrentVersion);
     }
 
-    public static async Task<string> DownloadUpdateAsync(UpdateInfo update, CancellationToken cancellationToken = default)
+    public static async Task<string> DownloadUpdateAsync(
+        UpdateInfo update,
+        IProgress<DownloadProgress>? progress = null,
+        CancellationToken cancellationToken = default)
     {
         var tempPath = Path.Combine(Path.GetTempPath(), $"Switcher.{update.TagName}.exe");
         using var client = CreateClient(TimeSpan.FromMinutes(10));
         using var response = await client.GetAsync(update.DownloadUrl, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
         response.EnsureSuccessStatusCode();
+        var contentLength = response.Content.Headers.ContentLength;
+        long? totalBytes = contentLength is > 0
+            ? contentLength.Value
+            : update.Size > 0 ? update.Size : null;
+
+        progress?.Report(new DownloadProgress(0, totalBytes));
         await using var source = await response.Content.ReadAsStreamAsync(cancellationToken);
         await using var target = File.Create(tempPath);
-        await source.CopyToAsync(target, cancellationToken);
+        var buffer = new byte[81920];
+        long received = 0;
+        while (true)
+        {
+            var read = await source.ReadAsync(buffer, cancellationToken);
+            if (read == 0)
+            {
+                break;
+            }
+
+            await target.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
+            received += read;
+            progress?.Report(new DownloadProgress(received, totalBytes));
+        }
+
+        progress?.Report(new DownloadProgress(received, totalBytes ?? received));
         return tempPath;
     }
 
