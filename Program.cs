@@ -101,6 +101,11 @@ internal static class SelfTest
         CheckAuto(failures, "ntcn", "тест");
         CheckAuto(failures, "ьн", "my");
         CheckAuto(failures, "рш", "hi");
+        CheckAuto(failures, "rjhbljh", "коридор");
+        CheckAuto(failures, "rjvyfnf", "комната");
+        CheckAuto(failures, "сщккшвщк", "corridor");
+        CheckAuto(failures, "rjhbljhysq", "коридорный");
+        CheckAuto(failures, "сщккшвщкы", "corridors");
         CheckCustomAuto(failures);
         CheckExactAutoReplacement(failures);
         CheckTextConversion(failures, "ghbdtn vbh", "привет мир");
@@ -109,6 +114,8 @@ internal static class SelfTest
         CheckManual(failures, "сщву", "code");
         CheckNoAuto(failures, "test");
         CheckNoAuto(failures, "code");
+        CheckNoAuto(failures, "qwerty");
+        CheckNoAuto(failures, "asdfgh");
         CheckNeverCorrect(failures);
         CheckDefaultReplacements(failures);
         CheckSettingsRoundTrip(failures);
@@ -4250,7 +4257,7 @@ internal sealed record AutoReplacementRule
 
 internal static class AutoReplacementDefaults
 {
-    public const int Version = 1;
+    public const int Version = 2;
 
     private const string LatinKeys = "`qwertyuiop[]asdfghjkl;'zxcvbnm,./";
     private const string CyrillicKeys = "ёйцукенгшщзхъфывапролджэячсмитьбю.";
@@ -4276,6 +4283,13 @@ internal static class AutoReplacementDefaults
         "медленно", "работает", "запущено", "установлено", "доступно", "найдено",
         "ссылка", "понял", "давай", "нормально", "сейчас", "потом", "после", "перед",
         "новый", "старый", "общий",
+        "квартира", "комната", "кухня", "коридор", "ванная", "туалет", "дверь",
+        "стена", "потолок", "стол", "стул", "шкаф", "диван", "кровать", "лампа",
+        "молоко", "магазин", "улица", "машина", "поезд", "такси", "деньги",
+        "карта", "заказ", "товар", "доставка", "звонок", "контакт", "фамилия",
+        "семья", "друзья", "ребенок", "школа", "офис", "склад", "написать",
+        "получить", "почему", "когда", "откуда", "который", "которая", "которые",
+        "правильно", "неправильно", "дальше", "лучше", "главное", "обычный", "частый",
     ];
 
     private static readonly string[] EnglishWords =
@@ -4299,6 +4313,12 @@ internal static class AutoReplacementDefaults
         "notification", "tray", "menu", "dialog", "selection", "clipboard", "configuration",
         "config", "help", "hint", "guide", "first", "last", "new", "old", "current", "latest",
         "available", "found", "path", "link", "normal", "now", "later", "before", "after", "next",
+        "room", "house", "kitchen", "corridor", "bathroom", "toilet", "door", "wall",
+        "floor", "ceiling", "chair", "desk", "lamp", "light", "water", "milk", "coffee",
+        "food", "shop", "store", "street", "train", "taxi", "money", "order", "price",
+        "product", "delivery", "pickup", "contact", "family", "friend", "children",
+        "school", "office", "warehouse", "write", "typing", "wrong", "correct", "better",
+        "worse", "common",
     ];
 
     public static List<AutoReplacementRule> Create()
@@ -5234,6 +5254,15 @@ internal static class TextHeuristics
         "медленно", "работает", "запущено", "установлено", "доступно", "найдено",
         "ссылка", "окей", "понял", "давай", "нормально", "класс", "супер", "сейчас",
         "потом", "после", "перед", "первый", "последний", "новый", "старый", "общий",
+        "дом", "квартира", "комната", "кухня", "коридор", "ванная", "туалет", "дверь",
+        "стена", "пол", "потолок", "стол", "стул", "шкаф", "диван", "кровать", "лампа",
+        "свет", "вода", "молоко", "чай", "кофе", "еда", "магазин", "улица", "машина",
+        "поезд", "такси", "ключ", "сумка", "деньги", "карта", "чек", "заказ", "цена",
+        "товар", "доставка", "самовывоз", "звонок", "контакт", "имя", "фамилия",
+        "семья", "друг", "друзья", "ребенок", "дети", "школа", "офис", "склад",
+        "пишу", "пишешь", "написать", "написал", "получить", "получил", "почему",
+        "когда", "куда", "откуда", "который", "которая", "которые", "правильно",
+        "неправильно", "дальше", "лучше", "хуже", "главное", "обычный", "частый",
     };
 
     private static readonly HashSet<string> EnglishWords = new(StringComparer.OrdinalIgnoreCase)
@@ -5262,18 +5291,28 @@ internal static class TextHeuristics
         "settings", "configuration", "config", "help", "hint", "guide", "first", "last",
         "new", "old", "current", "latest", "available", "found", "path", "link",
         "normal", "class", "super", "now", "later", "before", "after", "next",
+        "room", "house", "home", "kitchen", "corridor", "bathroom", "toilet", "door",
+        "wall", "floor", "ceiling", "chair", "desk", "lamp", "light", "water", "milk",
+        "coffee", "tea", "food", "shop", "store", "street", "car", "train", "taxi",
+        "money", "card", "order", "price", "product", "delivery", "pickup", "contact",
+        "family", "friend", "children", "school", "office", "warehouse", "write",
+        "typing", "typed", "wrong", "correct", "better", "worse", "main", "common",
     };
 
     private static readonly string[] RussianFragments =
     [
         "пр", "ст", "но", "то", "на", "ен", "ов", "ни", "ра", "ко", "по", "ре", "ть",
+        "ор", "ро", "ри", "ид", "до", "ом", "мо", "ол", "ло", "ок", "ва", "ал", "ел",
+        "ла", "ит", "ся", "де", "ле", "ка", "ки", "за", "да", "вы", "ый", "ой",
         "ого", "его", "ать", "ить", "ный", "ая", "ое", "ые", "ение", "ция",
     ];
 
     private static readonly string[] EnglishFragments =
     [
         "th", "he", "in", "er", "an", "re", "on", "at", "en", "nd", "st", "es", "or",
-        "te", "ing", "ion", "tion", "ed", "ly", "ent", "ment", "ous",
+        "te", "co", "ro", "ri", "id", "do", "ra", "al", "le", "el", "ve", "se", "ar",
+        "ow", "ou", "ch", "sh", "ck", "om", "ing", "ion", "tion", "ed", "ly", "ent",
+        "ment", "ous", "pro", "com", "ver", "der",
     ];
 
     public static bool TryAutoCorrect(string word, AppSettings settings, out CorrectionResult correction)
@@ -5351,6 +5390,17 @@ internal static class TextHeuristics
         {
             correction = converted;
             reason = $"короткое слово разрешено профилем {DisplayProfile(settings.CorrectionProfile)}, score {sourceScore}->{targetScore}";
+            return true;
+        }
+
+        if (word.Length >= 5
+            && !targetIsKnownWord
+            && IsWeakSourceWord(word, converted.Direction, sourceScore)
+            && targetScore >= thresholds.LongUnknownTargetScore
+            && targetScore - sourceScore >= thresholds.LongUnknownDelta)
+        {
+            correction = converted;
+            reason = $"длинное слово похоже на набор в неверной раскладке, профиль {DisplayProfile(settings.CorrectionProfile)}, score {sourceScore}->{targetScore}";
             return true;
         }
 
@@ -5573,7 +5623,7 @@ internal static class TextHeuristics
 
     private static int VowelScore(string lower, string vowels)
     {
-        var vowelCount = lower.Count(vowels.Contains);
+        var vowelCount = CountVowels(lower, vowels);
         if (vowelCount == 0)
         {
             return -4;
@@ -5586,6 +5636,27 @@ internal static class TextHeuristics
         }
 
         return 0;
+    }
+
+    private static bool IsWeakSourceWord(string word, LayoutDirection direction, int sourceScore)
+    {
+        var lower = word.ToLowerInvariant();
+        var vowels = direction == LayoutDirection.LatinToCyrillic
+            ? "aeiouy"
+            : "аеёиоуыэюя";
+        var vowelRatio = VowelRatio(lower, vowels);
+        return sourceScore <= -8
+            || (lower.Length >= 6 && sourceScore <= 0 && vowelRatio <= 0.16);
+    }
+
+    private static double VowelRatio(string lower, string vowels)
+    {
+        return lower.Length == 0 ? 0 : (double)CountVowels(lower, vowels) / lower.Length;
+    }
+
+    private static int CountVowels(string lower, string vowels)
+    {
+        return lower.Count(vowels.Contains);
     }
 
     private static bool IsKnownRussianWord(string word, AppSettings settings)
@@ -5617,6 +5688,8 @@ internal static class TextHeuristics
         int KnownWordDelta,
         int ShortWordTargetScore,
         int ShortWordDelta,
+        int LongUnknownTargetScore,
+        int LongUnknownDelta,
         int TargetScore,
         int ScoreDelta)
     {
@@ -5624,9 +5697,9 @@ internal static class TextHeuristics
         {
             return profile switch
             {
-                CorrectionProfile.Careful => new CorrectionThresholds(12, 14, 12, 28, 20),
-                CorrectionProfile.Bold => new CorrectionThresholds(5, 8, 6, 18, 10),
-                _ => new CorrectionThresholds(8, 10, 8, 22, 14),
+                CorrectionProfile.Careful => new CorrectionThresholds(12, 14, 12, 18, 22, 28, 20),
+                CorrectionProfile.Bold => new CorrectionThresholds(5, 8, 6, 12, 12, 18, 10),
+                _ => new CorrectionThresholds(8, 10, 8, 14, 14, 22, 14),
             };
         }
     }

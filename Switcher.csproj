@@ -9,7 +9,7 @@
     <ApplicationIcon />
     <AssemblyName>Switcher</AssemblyName>
     <RootNamespace>Switcher</RootNamespace>
-    <Version>0.11.0</Version>
+    <Version>0.12.0</Version>
     <RepositoryUrl>https://github.com/yavasilek/Switcher</RepositoryUrl>
     <DebugType>embedded</DebugType>
     <PublishSingleFile>true</PublishSingleFile>
