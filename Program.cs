@@ -296,6 +296,11 @@ internal static class SelfTest
                 CorrectionProfile = CorrectionProfile.Bold,
                 DarkTheme = true,
                 BuiltInReplacementsVersion = AutoReplacementDefaults.Version,
+                LastUpdateCheckUtc = new DateTime(2026, 1, 2, 3, 4, 5, DateTimeKind.Utc),
+                LastUpdateCheckFailed = true,
+                LastUpdateCheckMessage = "network timeout",
+                LastAvailableUpdateTagName = "v99.0.0",
+                LastAvailableUpdatePageUrl = "https://github.com/yavasilek/Switcher/releases/tag/v99.0.0",
                 CustomAutoReplacements = [new AutoReplacementRule { Original = "ghbdtn", Corrected = "привет", Enabled = false }],
                 DecisionLog = [new DecisionLogItem { Original = "ghbdtn", Corrected = "привет", Reason = "test" }],
                 ConvertWordHotkey = new HotkeyBinding { Ctrl = true, Alt = false, Key = Keys.F8 },
@@ -344,6 +349,15 @@ internal static class SelfTest
             if (loaded.ConvertWordHotkey.Key != Keys.F8 || !loaded.ConvertWordHotkey.Ctrl || loaded.ConvertWordHotkey.Alt)
             {
                 failures.Add($"SETTINGS roundtrip: hotkey was not preserved, actual {loaded.ConvertWordHotkey}");
+            }
+
+            if (loaded.LastUpdateCheckUtc != settings.LastUpdateCheckUtc
+                || !loaded.LastUpdateCheckFailed
+                || loaded.LastUpdateCheckMessage != "network timeout"
+                || loaded.LastAvailableUpdateTagName != "v99.0.0"
+                || loaded.LastAvailableUpdatePageUrl.Length == 0)
+            {
+                failures.Add("SETTINGS roundtrip: update check state was not preserved");
             }
         }
         catch (Exception ex)
@@ -453,6 +467,7 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
 {
     private static readonly TimeSpan BackgroundUpdateDelay = TimeSpan.FromSeconds(8);
     private static readonly TimeSpan UpdateCheckInterval = TimeSpan.FromHours(12);
+    private static readonly TimeSpan UpdateCheckTimerInterval = TimeSpan.FromMinutes(1);
     private static readonly TimeSpan HookStaleAfter = TimeSpan.FromMinutes(20);
     private static readonly TimeSpan HookRepairCooldown = TimeSpan.FromMinutes(10);
     private static readonly TimeSpan PasswordPositiveCacheTtl = TimeSpan.FromMilliseconds(700);
@@ -462,6 +477,7 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
     private readonly NotifyIcon _notifyIcon;
     private readonly KeyboardHook _keyboardHook;
     private readonly System.Windows.Forms.Timer _healthTimer = new();
+    private readonly System.Windows.Forms.Timer _updateCheckTimer = new();
     private readonly StringBuilder _currentWord = new();
     private readonly DiagnosticState _diagnostics = new();
     private SettingsForm? _settingsForm;
@@ -471,6 +487,7 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
     private LastTypedSegment? _lastTypedSegment;
     private LastCorrection? _lastCorrection;
     private UpdateInfo? _availableUpdate;
+    private bool _updateCheckInProgress;
     private DateTime? _pauseUntilUtc;
     private string? _lastExternalProcessName;
     private AppSettings _settings;
@@ -494,7 +511,10 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         _healthTimer.Interval = 60000;
         _healthTimer.Tick += (_, _) => CheckHookHealth();
         _healthTimer.Start();
-        _ = CheckForUpdatesInBackgroundAsync();
+        _updateCheckTimer.Interval = (int)UpdateCheckTimerInterval.TotalMilliseconds;
+        _updateCheckTimer.Tick += (_, _) => _ = CheckForUpdatesInBackgroundAsync();
+        _updateCheckTimer.Start();
+        _ = CheckForUpdatesInBackgroundAsync(BackgroundUpdateDelay);
         if (!_settings.FirstRunHintShown)
         {
             _ = ShowFirstRunHintLaterAsync();
@@ -529,6 +549,10 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
 
     public UpdateInfo? AvailableUpdate => _availableUpdate;
 
+    public bool IsUpdateCheckInProgress => _updateCheckInProgress;
+
+    public DateTime? NextUpdateCheckUtc => GetNextUpdateCheckUtc();
+
     public string DiagnosticsText => BuildDiagnosticsText();
 
     public string InstallationStatus
@@ -557,6 +581,23 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         _settingsForm?.RefreshFromSettings();
     }
 
+    public void SetAutoCheckUpdates(bool enabled)
+    {
+        _settings.AutoCheckUpdates = enabled;
+        if (!enabled)
+        {
+            _availableUpdate = null;
+        }
+
+        SettingsStore.Save(_settings);
+        RefreshMenu();
+        _settingsForm?.RefreshFromSettings();
+        if (enabled)
+        {
+            _ = CheckForUpdatesInBackgroundAsync(TimeSpan.FromSeconds(2), force: true);
+        }
+    }
+
     public void ReplaceSettings(AppSettings settings)
     {
         _settings = settings;
@@ -566,6 +607,10 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         ResetTypingState();
         RefreshMenu();
         _settingsForm?.RefreshFromSettings();
+        if (_settings.AutoCheckUpdates)
+        {
+            _ = CheckForUpdatesInBackgroundAsync(TimeSpan.FromSeconds(2), force: true);
+        }
     }
 
     public void ExportSettings(string filePath)
@@ -583,6 +628,8 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         SettingsStore.Save(_settings);
         _healthTimer.Stop();
         _healthTimer.Dispose();
+        _updateCheckTimer.Stop();
+        _updateCheckTimer.Dispose();
         _keyboardHook.Dispose();
         _notifyIcon.Visible = false;
         _notifyIcon.Dispose();
@@ -746,7 +793,10 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
 
         if (menu.Items["CheckUpdates"] is ToolStripMenuItem checkUpdatesItem)
         {
-            checkUpdatesItem.Text = _availableUpdate?.IsNewer == true
+            checkUpdatesItem.Enabled = !_updateCheckInProgress;
+            checkUpdatesItem.Text = _updateCheckInProgress
+                ? "Проверяю обновления..."
+                : _availableUpdate?.IsNewer == true
                 ? $"Установить обновление {_availableUpdate.TagName}"
                 : "Проверить обновления";
         }
@@ -1420,8 +1470,7 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         }
         catch (Exception ex)
         {
-            _settings.LastUpdateCheckUtc = DateTime.UtcNow;
-            SettingsStore.Save(_settings);
+            StoreUpdateCheckFailure(ex);
             if (showResult)
             {
                 MessageBox.Show($"Не удалось проверить обновления:\r\n{ex.Message}", "Switcher", MessageBoxButtons.OK, MessageBoxIcon.Error);
@@ -1472,22 +1521,27 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         }
     }
 
-    private async Task CheckForUpdatesInBackgroundAsync()
+    private async Task CheckForUpdatesInBackgroundAsync(TimeSpan? delay = null, bool force = false)
     {
-        if (!_settings.AutoCheckUpdates)
+        if (delay is not null)
+        {
+            await Task.Delay(delay.Value);
+        }
+
+        if (!_settings.AutoCheckUpdates || _updateCheckInProgress)
         {
             return;
         }
 
-        if (_settings.LastUpdateCheckUtc is { } lastCheck
-            && DateTime.UtcNow - lastCheck.ToUniversalTime() < UpdateCheckInterval)
+        if (!force && !IsUpdateCheckDue())
         {
             return;
         }
 
+        _updateCheckInProgress = true;
+        RefreshUpdateCheckUi();
         try
         {
-            await Task.Delay(BackgroundUpdateDelay);
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(6));
             var update = await UpdateManager.CheckLatestAsync(timeout.Token);
             StoreUpdateCheckResult(update);
@@ -1501,14 +1555,18 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
                         $"{update.TagName} готова к установке. Открой меню трея.",
                         ToolTipIcon.Info);
                     RefreshMenu();
-                    _settingsForm?.RefreshFromSettings();
+                    _settingsForm?.RefreshInstallState();
                 });
             }
         }
-        catch
+        catch (Exception ex)
         {
-            _settings.LastUpdateCheckUtc = DateTime.UtcNow;
-            SettingsStore.Save(_settings);
+            StoreUpdateCheckFailure(ex);
+        }
+        finally
+        {
+            _updateCheckInProgress = false;
+            RefreshUpdateCheckUi();
         }
     }
 
@@ -1555,16 +1613,69 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         }
     }
 
+    private bool IsUpdateCheckDue()
+    {
+        if (_settings.LastUpdateCheckUtc is not { } lastCheck)
+        {
+            return true;
+        }
+
+        return DateTime.UtcNow >= lastCheck.ToUniversalTime().Add(UpdateCheckInterval);
+    }
+
+    private DateTime? GetNextUpdateCheckUtc()
+    {
+        if (!_settings.AutoCheckUpdates)
+        {
+            return null;
+        }
+
+        if (_settings.LastUpdateCheckUtc is not { } lastCheck)
+        {
+            return DateTime.UtcNow.Add(BackgroundUpdateDelay);
+        }
+
+        var nextCheck = lastCheck.ToUniversalTime().Add(UpdateCheckInterval);
+        return nextCheck <= DateTime.UtcNow ? DateTime.UtcNow : nextCheck;
+    }
+
     private void StoreUpdateCheckResult(UpdateInfo update)
     {
         _availableUpdate = update.IsNewer ? update : null;
         _settings.LastUpdateCheckUtc = DateTime.UtcNow;
+        _settings.LastUpdateCheckFailed = false;
+        _settings.LastUpdateCheckMessage = "";
+        _settings.LastAvailableUpdateTagName = update.IsNewer ? update.TagName : "";
+        _settings.LastAvailableUpdatePageUrl = update.IsNewer ? update.PageUrl : "";
         SettingsStore.Save(_settings);
+        RefreshUpdateCheckUi();
+    }
+
+    private void StoreUpdateCheckFailure(Exception ex)
+    {
+        _availableUpdate = null;
+        _settings.LastUpdateCheckUtc = DateTime.UtcNow;
+        _settings.LastUpdateCheckFailed = true;
+        _settings.LastUpdateCheckMessage = TrimUpdateCheckMessage(ex.Message);
+        _settings.LastAvailableUpdateTagName = "";
+        _settings.LastAvailableUpdatePageUrl = "";
+        SettingsStore.Save(_settings);
+        RefreshUpdateCheckUi();
+    }
+
+    private void RefreshUpdateCheckUi()
+    {
         PostToUi(() =>
         {
             RefreshMenu();
-            _settingsForm?.RefreshFromSettings();
+            _settingsForm?.RefreshInstallState();
         });
+    }
+
+    private static string TrimUpdateCheckMessage(string message)
+    {
+        var normalized = message.ReplaceLineEndings(" ").Trim();
+        return normalized.Length <= 80 ? normalized : normalized[..77] + "...";
     }
 
     private void PostToUi(Action action)
@@ -2807,7 +2918,7 @@ internal sealed class SettingsForm : Form
         {
             if (!_updating)
             {
-                _context.UpdateSettings(s => s.AutoCheckUpdates = _autoCheckUpdates.Checked);
+                _context.SetAutoCheckUpdates(_autoCheckUpdates.Checked);
             }
         };
         _correctionProfile.SelectedIndexChanged += (_, _) =>
@@ -3295,7 +3406,7 @@ internal sealed class SettingsForm : Form
         }
     }
 
-    private void RefreshInstallState()
+    public void RefreshInstallState()
     {
         if (_context.AvailableUpdate?.IsNewer == true)
         {
@@ -3396,16 +3507,62 @@ internal sealed class SettingsForm : Form
 
     private string BuildUpdateStatusText()
     {
+        if (_context.IsUpdateCheckInProgress)
+        {
+            return "Проверяю GitHub Releases...";
+        }
+
         if (_latestUpdate is not null)
         {
             return _latestUpdate.IsNewer
-                ? $"Доступна версия {_latestUpdate.TagName}."
+                ? $"Доступна версия {_latestUpdate.TagName}. Можно установить обновление."
                 : $"Установлена актуальная версия v{ApplicationInfo.CurrentVersionText}.";
         }
 
-        return _context.Settings.LastUpdateCheckUtc is { } lastCheck
-            ? $"Последняя фоновая проверка: {lastCheck.ToLocalTime():dd.MM.yyyy HH:mm}. Новых версий не найдено."
-            : "Обновления ещё не проверялись.";
+        var settings = _context.Settings;
+        if (!settings.AutoCheckUpdates)
+        {
+            return "Автопроверка выключена. Можно проверить обновления вручную.";
+        }
+
+        if (settings.LastUpdateCheckUtc is not { } lastCheck)
+        {
+            return "Автопроверка включена. Первая проверка начнётся через несколько секунд.";
+        }
+
+        var checkedAt = lastCheck.ToLocalTime().ToString("dd.MM.yyyy HH:mm");
+        var nextCheck = FormatNextUpdateCheck();
+        if (settings.LastUpdateCheckFailed)
+        {
+            var message = string.IsNullOrWhiteSpace(settings.LastUpdateCheckMessage)
+                ? "неизвестная ошибка"
+                : settings.LastUpdateCheckMessage;
+            return $"Последняя проверка: {checkedAt}. Ошибка: {message}\r\nСледующая попытка: {nextCheck}.";
+        }
+
+        if (!string.IsNullOrWhiteSpace(settings.LastAvailableUpdateTagName))
+        {
+            return $"Последняя проверка: {checkedAt}. Доступна версия {settings.LastAvailableUpdateTagName}.\r\nНажмите «Проверить обновления», чтобы обновить данные.";
+        }
+
+        return $"Последняя проверка: {checkedAt}. Новых версий не найдено.\r\nСледующая проверка: {nextCheck}.";
+    }
+
+    private string FormatNextUpdateCheck()
+    {
+        var nextCheck = _context.NextUpdateCheckUtc;
+        if (nextCheck is null)
+        {
+            return "не запланирована";
+        }
+
+        var utc = nextCheck.Value.ToUniversalTime();
+        if (utc <= DateTime.UtcNow.AddMinutes(1))
+        {
+            return "скоро";
+        }
+
+        return utc.ToLocalTime().ToString("dd.MM.yyyy HH:mm");
     }
 
     private async Task CheckUpdatesFromFormAsync()
@@ -4301,6 +4458,10 @@ internal sealed record AppSettings
     public CorrectionProfile CorrectionProfile { get; set; } = CorrectionProfile.Balanced;
     public int BuiltInReplacementsVersion { get; set; }
     public DateTime? LastUpdateCheckUtc { get; set; }
+    public bool LastUpdateCheckFailed { get; set; }
+    public string LastUpdateCheckMessage { get; set; } = "";
+    public string LastAvailableUpdateTagName { get; set; } = "";
+    public string LastAvailableUpdatePageUrl { get; set; } = "";
     public string EnToRuSound { get; set; } = SoundPlayerNames.Asterisk;
     public string RuToEnSound { get; set; } = SoundPlayerNames.Question;
     public HotkeyBinding ConvertWordHotkey { get; set; } = DefaultConvertWordHotkey();
@@ -4831,6 +4992,20 @@ internal static class SettingsStore
         settings.CustomAutoReplacements ??= [];
         settings.History ??= [];
         settings.DecisionLog ??= [];
+        settings.LastUpdateCheckMessage = NormalizeSingleLine(settings.LastUpdateCheckMessage);
+        settings.LastAvailableUpdateTagName = NormalizeSingleLine(settings.LastAvailableUpdateTagName);
+        settings.LastAvailableUpdatePageUrl = NormalizeSingleLine(settings.LastAvailableUpdatePageUrl);
+        if (!IsStoredUpdateNewer(settings.LastAvailableUpdateTagName))
+        {
+            settings.LastAvailableUpdateTagName = "";
+            settings.LastAvailableUpdatePageUrl = "";
+        }
+
+        if (settings.LastAvailableUpdateTagName.Length == 0)
+        {
+            settings.LastAvailableUpdatePageUrl = "";
+        }
+
         settings.ExcludedProcesses = NormalizeList(settings.ExcludedProcesses);
         settings.CustomRussianWords = NormalizeList(settings.CustomRussianWords);
         settings.CustomEnglishWords = NormalizeList(settings.CustomEnglishWords);
@@ -4866,6 +5041,22 @@ internal static class SettingsStore
             .Where(value => value.Length > 0)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
+    }
+
+    private static string NormalizeSingleLine(string? value)
+    {
+        return (value ?? "").ReplaceLineEndings(" ").Trim();
+    }
+
+    private static bool IsStoredUpdateNewer(string tagName)
+    {
+        if (string.IsNullOrWhiteSpace(tagName))
+        {
+            return false;
+        }
+
+        return Version.TryParse(tagName.Trim().TrimStart('v', 'V'), out var version)
+            && version > ApplicationInfo.CurrentVersion;
     }
 }
 
