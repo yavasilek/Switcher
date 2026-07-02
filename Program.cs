@@ -101,6 +101,14 @@ internal static class SelfTest
         CheckAuto(failures, "ntcn", "тест");
         CheckAuto(failures, "ьн", "my");
         CheckAuto(failures, "рш", "hi");
+        CheckAuto(failures, "yf", "на");
+        CheckAuto(failures, "yt", "не");
+        CheckAuto(failures, "vs", "мы");
+        CheckAuto(failures, "jy", "он");
+        CheckAuto(failures, "фт", "an");
+        CheckAuto(failures, "ща", "of");
+        CheckAuto(failures, "ше", "it");
+        CheckAuto(failures, "цу", "we");
         CheckAuto(failures, "rjhbljh", "коридор");
         CheckAuto(failures, "rjvyfnf", "комната");
         CheckAuto(failures, "сщккшвщк", "corridor");
@@ -119,6 +127,12 @@ internal static class SelfTest
         CheckNoAuto(failures, "code");
         CheckNoAuto(failures, "qwerty");
         CheckNoAuto(failures, "asdfgh");
+        CheckNoAuto(failures, "на");
+        CheckNoAuto(failures, "не");
+        CheckNoAuto(failures, "он");
+        CheckNoAuto(failures, "an");
+        CheckNoAuto(failures, "of");
+        CheckNoAuto(failures, "to");
         CheckNeverCorrect(failures);
         CheckDefaultReplacements(failures);
         CheckSettingsRoundTrip(failures);
@@ -249,6 +263,16 @@ internal static class SelfTest
         if (!rules.Any(rule => rule.Original == "вудшмукн" && rule.Corrected == "delivery"))
         {
             failures.Add("DEFAULT replacements: missing вудшмукн -> delivery");
+        }
+
+        if (!rules.Any(rule => rule.Original == "yf" && rule.Corrected == "на"))
+        {
+            failures.Add("DEFAULT replacements: missing yf -> на");
+        }
+
+        if (!rules.Any(rule => rule.Original == "фт" && rule.Corrected == "an"))
+        {
+            failures.Add("DEFAULT replacements: missing фт -> an");
         }
     }
 
@@ -4398,6 +4422,8 @@ internal static class BuiltInWordBase
     }
 
     private const string RussianRaw = """
+        бы вы во все всё где да для до его ее ещё же за из или как ко кто ли мы на над не
+        нет ни но об он она они оно от по под при про со там те то тот тут уже чем что
         а август августе автор автора авто автомобиль автомобиля адреса акция акции активный
         алексей анализ англия английского английские английских апрель апреля архив банка банк
         базе база базы баланс без безопасность белый белая билет билеты бизнес бизнеса близко
@@ -4450,6 +4476,7 @@ internal static class BuiltInWordBase
         """;
 
     private const string EnglishRaw = """
+        am an as at be by do go he hi if in is it me my no of ok on or so to up us we
         ability about above accept access account action active actually add address admin after
         again against age agent ago agree ahead alert allow almost alone along already also always
         amount analysis android answer anyone anything appear apply april area around ask asset
@@ -4491,7 +4518,7 @@ internal static class BuiltInWordBase
 
 internal static class AutoReplacementDefaults
 {
-    public const int Version = 3;
+    public const int Version = 4;
 
     private const string LatinKeys = "`qwertyuiop[]asdfghjkl;'zxcvbnm,./";
     private const string CyrillicKeys = "ёйцукенгшщзхъфывапролджэячсмитьбю.";
