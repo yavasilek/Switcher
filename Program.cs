@@ -112,6 +112,7 @@ internal static class SelfTest
         CheckExactAutoReplacement(failures);
         CheckTextConversion(failures, "ghbdtn vbh", "привет мир");
         CheckTextConversion(failures, "руддщ цщкдв", "hello world");
+        CheckTextConversion(failures, "rjhbljh ", "коридор ");
         CheckManual(failures, "vtyz", "меня");
         CheckManual(failures, "сщву", "code");
         CheckNoAuto(failures, "test");
@@ -393,6 +394,18 @@ internal static class SelfTest
             || !InputSender.IsKeyDownInputForSelfTest(restores[1], Keys.Menu))
         {
             failures.Add("INPUT modifiers: expected Ctrl then Alt key-down after replacement");
+        }
+
+        var chord = InputSender.BuildChordInputsForSelfTest([Keys.ControlKey, Keys.ShiftKey, Keys.Left]);
+        if (chord.Length != 6
+            || !InputSender.IsKeyDownInputForSelfTest(chord[0], Keys.ControlKey)
+            || !InputSender.IsKeyDownInputForSelfTest(chord[1], Keys.ShiftKey)
+            || !InputSender.IsKeyDownInputForSelfTest(chord[2], Keys.Left)
+            || !InputSender.IsKeyUpInputForSelfTest(chord[3], Keys.Left)
+            || !InputSender.IsKeyUpInputForSelfTest(chord[4], Keys.ShiftKey)
+            || !InputSender.IsKeyUpInputForSelfTest(chord[5], Keys.ControlKey))
+        {
+            failures.Add("INPUT chord: expected Ctrl+Shift+Left key-down and reverse key-up");
         }
     }
 
@@ -964,7 +977,13 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
 
         if (_lastTypedSegment is null)
         {
+            if (ConvertWordNearCaretManually())
+            {
+                return;
+            }
+
             PlayErrorSound();
+            UpdateBalloon("Ручная конвертация", "слово рядом с курсором не найдено");
             return;
         }
 
@@ -989,6 +1008,76 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         MaybeLearnAutoReplacement(segment.Word, segmentCorrection.Text);
         PlaySwitchSound(segmentCorrection.Direction);
         UpdateBalloon("Ручная конвертация", $"{segment.Word} -> {segmentCorrection.Text} ({segmentInputMethod})");
+    }
+
+    private bool ConvertWordNearCaretManually()
+    {
+        using var clipboard = ClipboardBackup.Capture();
+        if (TryConvertSelectedCaretWord(CaretWordSelection.Previous, clipboard)
+            || TryConvertSelectedCaretWord(CaretWordSelection.Next, clipboard))
+        {
+            return true;
+        }
+
+        clipboard.Restore();
+        return false;
+    }
+
+    private bool TryConvertSelectedCaretWord(CaretWordSelection selection, ClipboardBackup clipboard)
+    {
+        if (!SelectCaretWord(selection))
+        {
+            return false;
+        }
+
+        Clipboard.Clear();
+        InputSender.SendChord(Keys.ControlKey, Keys.C);
+        var selectedText = ClipboardBackup.WaitForText(TimeSpan.FromMilliseconds(350));
+        if (string.IsNullOrWhiteSpace(selectedText) || !TextHeuristics.TryConvertText(selectedText, out var correction))
+        {
+            CollapseCaretWordSelection(selection);
+            return false;
+        }
+
+        var layoutSwitch = NativeMethods.SwitchForegroundLayout(correction.TargetLayout);
+        StoreLayoutSwitch(layoutSwitch);
+        Clipboard.SetText(correction.Text, TextDataFormat.UnicodeText);
+        if (!InputSender.SendChord(Keys.ControlKey, Keys.V))
+        {
+            CollapseCaretWordSelection(selection);
+            return false;
+        }
+
+        Thread.Sleep(120);
+        clipboard.Restore();
+
+        ResetTypingState();
+        AddHistory("Ручная", selectedText, correction.Text);
+        AddDecisionLog("Ручная", TrimForStatus(selectedText), TrimForStatus(correction.Text), $"ручная конвертация слова у курсора ({DisplayCaretWordSelection(selection)})", applied: true);
+        MaybeLearnAutoReplacement(selectedText.Trim(), correction.Text.Trim());
+        PlaySwitchSound(correction.Direction);
+        UpdateBalloon("Ручная конвертация", $"{TrimForStatus(selectedText)} -> {TrimForStatus(correction.Text)}");
+        return true;
+    }
+
+    private static bool SelectCaretWord(CaretWordSelection selection)
+    {
+        var direction = selection == CaretWordSelection.Previous ? Keys.Left : Keys.Right;
+        var ok = InputSender.SendChord(Keys.ControlKey, Keys.ShiftKey, direction);
+        Thread.Sleep(60);
+        return ok;
+    }
+
+    private static void CollapseCaretWordSelection(CaretWordSelection selection)
+    {
+        var collapse = selection == CaretWordSelection.Previous ? Keys.Right : Keys.Left;
+        InputSender.SendKey(collapse);
+        Thread.Sleep(35);
+    }
+
+    private static string DisplayCaretWordSelection(CaretWordSelection selection)
+    {
+        return selection == CaretWordSelection.Previous ? "слева от курсора" : "справа от курсора";
     }
 
     private void ConvertSelectedTextManually()
@@ -5233,6 +5322,12 @@ internal static class TrayIconFactory
 
 internal sealed record LastTypedSegment(string Word, string Delimiter);
 
+internal enum CaretWordSelection
+{
+    Previous,
+    Next,
+}
+
 internal sealed record LastCorrection(
     string OriginalText,
     string CorrectedText,
@@ -6095,18 +6190,30 @@ internal static class InputSender
             return true;
         }
 
-        var inputs = new List<NativeMethods.Input>(keys.Length * 2);
-        foreach (var key in keys)
+        var modifiers = KeyboardState.GetPressedTextInputModifiers();
+        if (!ReleaseModifiers(modifiers))
         {
-            inputs.Add(KeyboardInput((ushort)key, 0, 0));
+            return false;
         }
 
-        for (var i = keys.Length - 1; i >= 0; i--)
+        try
         {
-            inputs.Add(KeyboardInput((ushort)keys[i], 0, KeyeventfKeyup));
+            return NativeMethods.SendKeyboardInput(BuildChordInputs(keys).ToArray());
         }
+        finally
+        {
+            RestoreStillPressedModifiers(modifiers);
+        }
+    }
 
-        return NativeMethods.SendKeyboardInput(inputs.ToArray());
+    public static bool SendKey(Keys key)
+    {
+        return SendChord(key);
+    }
+
+    internal static NativeMethods.Input[] BuildChordInputsForSelfTest(IReadOnlyList<Keys> keys)
+    {
+        return BuildChordInputs(keys).ToArray();
     }
 
     private static bool ReleaseModifiers(IReadOnlyList<Keys> modifiers)
@@ -6157,6 +6264,19 @@ internal static class InputSender
         {
             yield return KeyboardInput(0, ch, KeyeventfUnicode);
             yield return KeyboardInput(0, ch, KeyeventfUnicode | KeyeventfKeyup);
+        }
+    }
+
+    private static IEnumerable<NativeMethods.Input> BuildChordInputs(IReadOnlyList<Keys> keys)
+    {
+        foreach (var key in keys)
+        {
+            yield return KeyboardInput((ushort)key, 0, 0);
+        }
+
+        for (var i = keys.Count - 1; i >= 0; i--)
+        {
+            yield return KeyboardInput((ushort)keys[i], 0, KeyeventfKeyup);
         }
     }
 
