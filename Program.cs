@@ -124,6 +124,7 @@ internal static class SelfTest
         CheckListImportParser(failures);
         CheckPasswordDetectionFormatting(failures);
         CheckInputSize(failures);
+        CheckInputSenderModifierRelease(failures);
         CheckDownloadProgress(failures);
 
         if (failures.Count == 0)
@@ -372,6 +373,26 @@ internal static class SelfTest
         if (actual != expected)
         {
             failures.Add($"INPUT size: expected {expected}, actual {actual}");
+        }
+    }
+
+    private static void CheckInputSenderModifierRelease(List<string> failures)
+    {
+        var modifiers = new[] { Keys.ControlKey, Keys.Menu };
+        var releases = InputSender.BuildModifierKeyUpsForSelfTest(modifiers);
+        if (releases.Length != 2
+            || !InputSender.IsKeyUpInputForSelfTest(releases[0], Keys.Menu)
+            || !InputSender.IsKeyUpInputForSelfTest(releases[1], Keys.ControlKey))
+        {
+            failures.Add("INPUT modifiers: expected Alt then Ctrl key-up before replacement");
+        }
+
+        var restores = InputSender.BuildModifierKeyDownsForSelfTest(modifiers);
+        if (restores.Length != 2
+            || !InputSender.IsKeyDownInputForSelfTest(restores[0], Keys.ControlKey)
+            || !InputSender.IsKeyDownInputForSelfTest(restores[1], Keys.Menu))
+        {
+            failures.Add("INPUT modifiers: expected Ctrl then Alt key-down after replacement");
         }
     }
 
@@ -5909,6 +5930,8 @@ internal static class TextHeuristics
 
 internal static class KeyboardState
 {
+    private static readonly Keys[] TextInputModifiers = [Keys.ControlKey, Keys.Menu, Keys.ShiftKey];
+
     public static bool IsCtrlAltDown()
     {
         return IsKeyDown(Keys.ControlKey) && IsKeyDown(Keys.Menu);
@@ -5928,6 +5951,20 @@ internal static class KeyboardState
         return IsKeyDown(Keys.ControlKey) || IsKeyDown(Keys.Menu) || IsKeyDown(Keys.LWin) || IsKeyDown(Keys.RWin);
     }
 
+    public static Keys[] GetPressedTextInputModifiers()
+    {
+        return TextInputModifiers
+            .Where(IsKeyDown)
+            .ToArray();
+    }
+
+    public static Keys[] GetStillPhysicallyPressedModifiers(IEnumerable<Keys> modifiers)
+    {
+        return modifiers
+            .Where(IsKeyPhysicallyDown)
+            .ToArray();
+    }
+
     public static bool IsNavigationOrEditingKey(Keys key)
     {
         return key is Keys.Left or Keys.Right or Keys.Up or Keys.Down or Keys.Home or Keys.End
@@ -5937,6 +5974,11 @@ internal static class KeyboardState
     private static bool IsKeyDown(Keys key)
     {
         return (NativeMethods.GetKeyState((int)key) & 0x8000) != 0;
+    }
+
+    private static bool IsKeyPhysicallyDown(Keys key)
+    {
+        return (NativeMethods.GetAsyncKeyState((int)key) & 0x8000) != 0;
     }
 }
 
@@ -5953,25 +5995,31 @@ internal static class InputSender
             return true;
         }
 
-        var inputs = new List<NativeMethods.Input>((backspaceCount * 2) + (text.Length * 2));
-        for (var i = 0; i < backspaceCount; i++)
+        var modifiers = KeyboardState.GetPressedTextInputModifiers();
+        if (!ReleaseModifiers(modifiers))
         {
-            inputs.Add(KeyboardInput((ushort)Keys.Back, 0, 0));
-            inputs.Add(KeyboardInput((ushort)Keys.Back, 0, KeyeventfKeyup));
+            return false;
         }
 
-        foreach (var ch in text)
+        try
         {
-            inputs.Add(KeyboardInput(0, ch, KeyeventfUnicode));
-            inputs.Add(KeyboardInput(0, ch, KeyeventfUnicode | KeyeventfKeyup));
+            return NativeMethods.SendKeyboardInput(BuildReplacementInputs(backspaceCount, text).ToArray());
         }
-
-        return NativeMethods.SendKeyboardInput(inputs.ToArray());
+        finally
+        {
+            RestoreStillPressedModifiers(modifiers);
+        }
     }
 
     public static bool ReplaceTextViaClipboard(int backspaceCount, string text)
     {
         using var clipboard = ClipboardBackup.Capture();
+        var modifiers = KeyboardState.GetPressedTextInputModifiers();
+        if (!ReleaseModifiers(modifiers))
+        {
+            return false;
+        }
+
         try
         {
             if (backspaceCount > 0 && !SendBackspaces(backspaceCount))
@@ -5997,6 +6045,10 @@ internal static class InputSender
         {
             return false;
         }
+        finally
+        {
+            RestoreStillPressedModifiers(modifiers);
+        }
     }
 
     private static bool SendBackspaces(int count)
@@ -6014,6 +6066,26 @@ internal static class InputSender
         }
 
         return NativeMethods.SendKeyboardInput(inputs.ToArray());
+    }
+
+    internal static NativeMethods.Input[] BuildModifierKeyUpsForSelfTest(IReadOnlyList<Keys> modifiers)
+    {
+        return BuildModifierKeyUps(modifiers).ToArray();
+    }
+
+    internal static NativeMethods.Input[] BuildModifierKeyDownsForSelfTest(IReadOnlyList<Keys> modifiers)
+    {
+        return BuildModifierKeyDowns(modifiers).ToArray();
+    }
+
+    internal static bool IsKeyUpInputForSelfTest(NativeMethods.Input input, Keys key)
+    {
+        return input.U.Ki.WVk == (ushort)key && (input.U.Ki.DwFlags & KeyeventfKeyup) != 0;
+    }
+
+    internal static bool IsKeyDownInputForSelfTest(NativeMethods.Input input, Keys key)
+    {
+        return input.U.Ki.WVk == (ushort)key && (input.U.Ki.DwFlags & KeyeventfKeyup) == 0;
     }
 
     public static bool SendChord(params Keys[] keys)
@@ -6035,6 +6107,57 @@ internal static class InputSender
         }
 
         return NativeMethods.SendKeyboardInput(inputs.ToArray());
+    }
+
+    private static bool ReleaseModifiers(IReadOnlyList<Keys> modifiers)
+    {
+        return modifiers.Count == 0
+            || NativeMethods.SendKeyboardInput(BuildModifierKeyUps(modifiers).ToArray());
+    }
+
+    private static void RestoreStillPressedModifiers(IReadOnlyList<Keys> modifiers)
+    {
+        if (modifiers.Count == 0)
+        {
+            return;
+        }
+
+        var stillPressed = KeyboardState.GetStillPhysicallyPressedModifiers(modifiers);
+        if (stillPressed.Length > 0)
+        {
+            NativeMethods.SendKeyboardInput(BuildModifierKeyDowns(stillPressed).ToArray());
+        }
+    }
+
+    private static IEnumerable<NativeMethods.Input> BuildModifierKeyUps(IEnumerable<Keys> modifiers)
+    {
+        foreach (var modifier in modifiers.Reverse())
+        {
+            yield return KeyboardInput((ushort)modifier, 0, KeyeventfKeyup);
+        }
+    }
+
+    private static IEnumerable<NativeMethods.Input> BuildModifierKeyDowns(IEnumerable<Keys> modifiers)
+    {
+        foreach (var modifier in modifiers)
+        {
+            yield return KeyboardInput((ushort)modifier, 0, 0);
+        }
+    }
+
+    private static IEnumerable<NativeMethods.Input> BuildReplacementInputs(int backspaceCount, string text)
+    {
+        for (var i = 0; i < backspaceCount; i++)
+        {
+            yield return KeyboardInput((ushort)Keys.Back, 0, 0);
+            yield return KeyboardInput((ushort)Keys.Back, 0, KeyeventfKeyup);
+        }
+
+        foreach (var ch in text)
+        {
+            yield return KeyboardInput(0, ch, KeyeventfUnicode);
+            yield return KeyboardInput(0, ch, KeyeventfUnicode | KeyeventfKeyup);
+        }
     }
 
     private static NativeMethods.Input KeyboardInput(ushort virtualKey, ushort scanCode, uint flags)
@@ -6449,6 +6572,9 @@ internal static class NativeMethods
 
     [DllImport("user32.dll")]
     public static extern short GetKeyState(int nVirtKey);
+
+    [DllImport("user32.dll")]
+    public static extern short GetAsyncKeyState(int vKey);
 
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
