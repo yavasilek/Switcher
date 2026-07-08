@@ -124,9 +124,8 @@ internal static class SelfTest
         CheckManual(failures, "vtyz", "меня");
         CheckManual(failures, "сщву", "code");
         CheckManual(failures, ",kbyxbr", "блинчик");
-        CheckManual(failures, ".kbyxbr", "юлинчик");
         CheckTextConversion(failures, ",kbyxbr ", "блинчик ");
-        CheckTextConversion(failures, ".kbyxbr ", "юлинчик ");
+        CheckTextConversion(failures, ".kbyxbr ", ".линчик ");
         CheckNoAuto(failures, "test");
         CheckNoAuto(failures, "code");
         CheckNoAuto(failures, "qwerty");
@@ -5689,6 +5688,7 @@ internal static class TextHeuristics
 {
     private static readonly Dictionary<char, char> LatinToCyrillic = BuildLatinToCyrillic();
     private static readonly Dictionary<char, char> CyrillicToLatin = LatinToCyrillic.ToDictionary(pair => pair.Value, pair => pair.Key);
+    private static readonly HashSet<char> LatinLayoutExtraWordChars = new([',', '<', ';', ':', '\'', '"', '[', '{', ']', '}', '`', '~']);
 
     private static readonly HashSet<string> RussianWords = new(BuiltInWordBase.RussianWords, StringComparer.OrdinalIgnoreCase)
     {
@@ -5917,7 +5917,7 @@ internal static class TextHeuristics
             return false;
         }
 
-        if (original.All(IsLatin) && corrected.All(IsCyrillic))
+        if (CanConvertFromLatin(original) && corrected.All(IsCyrillic))
         {
             correction = new CorrectionResult(
                 corrected,
@@ -5927,7 +5927,7 @@ internal static class TextHeuristics
             return true;
         }
 
-        if (original.All(IsCyrillic) && corrected.All(IsLatin))
+        if (CanConvertFromCyrillic(original) && corrected.All(IsLatin))
         {
             correction = new CorrectionResult(
                 corrected,
@@ -5952,7 +5952,7 @@ internal static class TextHeuristics
         if (wordChars.All(IsLatinLayoutWordChar))
         {
             correction = new CorrectionResult(
-                ConvertWithMap(text, LatinToCyrillic),
+                ConvertWithMap(text, LatinToCyrillic, IsLatinLayoutWordChar),
                 LayoutDirection.LatinToCyrillic,
                 KeyboardLayout.English,
                 KeyboardLayout.Russian);
@@ -5962,7 +5962,7 @@ internal static class TextHeuristics
         if (wordChars.All(IsCyrillicLayoutWordChar))
         {
             correction = new CorrectionResult(
-                ConvertWithMap(text, CyrillicToLatin),
+                ConvertWithMap(text, CyrillicToLatin, IsCyrillicLayoutWordChar),
                 LayoutDirection.CyrillicToLatin,
                 KeyboardLayout.Russian,
                 KeyboardLayout.English);
@@ -6163,10 +6163,15 @@ internal static class TextHeuristics
 
     private static string ConvertWithMap(string text, IReadOnlyDictionary<char, char> map)
     {
+        return ConvertWithMap(text, map, _ => true);
+    }
+
+    private static string ConvertWithMap(string text, IReadOnlyDictionary<char, char> map, Func<char, bool> shouldConvert)
+    {
         var builder = new StringBuilder(text.Length);
         foreach (var ch in text)
         {
-            builder.Append(map.TryGetValue(ch, out var converted) ? converted : ch);
+            builder.Append(shouldConvert(ch) && map.TryGetValue(ch, out var converted) ? converted : ch);
         }
 
         return builder.ToString();
@@ -6184,8 +6189,7 @@ internal static class TextHeuristics
 
     private static bool IsLatinLayoutWordChar(char ch)
     {
-        return IsLatin(ch)
-            || (LatinToCyrillic.TryGetValue(ch, out var converted) && IsCyrillic(converted));
+        return IsLatin(ch) || LatinLayoutExtraWordChars.Contains(ch);
     }
 
     private static bool IsCyrillicLayoutWordChar(char ch)
