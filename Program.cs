@@ -87,7 +87,7 @@ internal static class Program
             }
         }
 
-        Application.Run(new SwitcherApplicationContext());
+        Application.Run(new SwitcherApplicationContext(args.Contains("--show-settings", StringComparer.OrdinalIgnoreCase)));
     }
 }
 
@@ -145,6 +145,7 @@ internal static class SelfTest
         CheckInputSenderModifierRelease(failures);
         CheckDownloadProgress(failures);
         FeaturePackSelfTests.Run(failures);
+        CheckDecisionLogFormatting(failures);
 
         if (failures.Count == 0)
         {
@@ -161,6 +162,23 @@ internal static class SelfTest
         if (!TextHeuristics.TryAutoCorrect(input, new AppSettings(), out var correction) || correction.Text != expected)
         {
             failures.Add($"AUTO {input}: expected {expected}, actual {correction?.Text ?? "<none>"}");
+        }
+    }
+
+    private static void CheckDecisionLogFormatting(List<string> failures)
+    {
+        var text = new DecisionLogItem
+        {
+            Original = "по",
+            Corrected = "gj",
+            Reason = "исходное слово уже похоже на известное слово",
+            Applied = false,
+        }.ToString();
+        if (!text.Contains("не изменено", StringComparison.Ordinal)
+            || !text.Contains("кандидат: gj", StringComparison.Ordinal)
+            || text.Contains("по -> gj", StringComparison.Ordinal))
+        {
+            failures.Add("DECISION LOG: skipped candidate looks like an applied correction");
         }
     }
 
@@ -513,7 +531,7 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
     private DateTime _lastTrayRefreshUtc;
     private AppSettings _settings;
 
-    public SwitcherApplicationContext()
+    public SwitcherApplicationContext(bool showSettingsOnStart = false)
     {
         _settings = SettingsStore.Load();
         _settings.StartWithWindows = StartupManager.IsEnabledForPath(InstallManager.PreferredStartupPath);
@@ -544,6 +562,11 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         if (!_settings.FirstRunHintShown)
         {
             _ = ShowFirstRunHintLaterAsync();
+        }
+
+        if (showSettingsOnStart)
+        {
+            PostToUi(() => ShowSettings());
         }
     }
 
@@ -2248,6 +2271,7 @@ internal sealed class SettingsForm : Form
     private readonly TextBox _diagnostics = new();
     private readonly ListBox _history = new();
     private readonly ListBox _decisionLog = new();
+    private readonly TextBox _decisionDetails = new();
     private readonly TextBox _decisionSearch = new();
     private readonly ComboBox _decisionFilter = new();
     private readonly Label _installStatus = new();
@@ -2285,15 +2309,15 @@ internal sealed class SettingsForm : Form
         Text = "Switcher";
         StartPosition = FormStartPosition.CenterScreen;
         AutoScaleMode = AutoScaleMode.Dpi;
-        MinimumSize = new Size(860, 650);
-        ClientSize = new Size(920, 680);
+        MinimumSize = new Size(980, 700);
+        ClientSize = new Size(1160, 800);
         Font = new Font("Segoe UI", 10F);
         BackColor = Color.FromArgb(247, 249, 252);
 
         var root = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
-            Padding = new Padding(22),
+            Padding = new Padding(18),
             RowCount = 4,
             ColumnCount = 1,
         };
@@ -2316,7 +2340,8 @@ internal sealed class SettingsForm : Form
         root.Controls.Add(_statusLabel, 0, 1);
 
         _tabs.Dock = DockStyle.Fill;
-        _tabs.Multiline = true;
+        _tabs.Multiline = false;
+        _tabs.SizeMode = TabSizeMode.Normal;
         _tabs.TabPages.Add(CreateGeneralTab());
         _tabs.TabPages.Add(CreateContextTab());
         _tabs.TabPages.Add(CreateListsTab());
@@ -2558,7 +2583,7 @@ internal sealed class SettingsForm : Form
 
     private TabPage CreateGeneralTab()
     {
-        var page = new TabPage("Основное");
+        var page = new TabPage("Основное") { AutoScroll = true };
         var layout = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
@@ -2567,10 +2592,10 @@ internal sealed class SettingsForm : Form
             ColumnCount = 1,
         };
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 120));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 166));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 94));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 76));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 150));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 82));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         page.Controls.Add(layout);
@@ -2606,26 +2631,25 @@ internal sealed class SettingsForm : Form
         var optionGrid = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
-            ColumnCount = 3,
-            RowCount = 3,
+            ColumnCount = 2,
+            RowCount = 5,
         };
-        optionGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.33F));
-        optionGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.33F));
-        optionGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.34F));
-        for (var row = 0; row < 3; row++)
+        optionGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
+        optionGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
+        for (var row = 0; row < 5; row++)
         {
-            optionGrid.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
+            optionGrid.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
         }
 
         optionGrid.Controls.Add(_autoSwitch, 0, 0);
         optionGrid.Controls.Add(_sound, 1, 0);
-        optionGrid.Controls.Add(_paused, 2, 0);
-        optionGrid.Controls.Add(_startup, 0, 1);
-        optionGrid.Controls.Add(_ignorePasswordFields, 1, 1);
-        optionGrid.Controls.Add(_aggressiveShortWords, 2, 1);
-        optionGrid.Controls.Add(_clipboardFallback, 0, 2);
-        optionGrid.Controls.Add(_autoHealKeyboardHook, 1, 2);
-        optionGrid.Controls.Add(_darkTheme, 2, 2);
+        optionGrid.Controls.Add(_paused, 0, 1);
+        optionGrid.Controls.Add(_startup, 1, 1);
+        optionGrid.Controls.Add(_ignorePasswordFields, 0, 2);
+        optionGrid.Controls.Add(_aggressiveShortWords, 1, 2);
+        optionGrid.Controls.Add(_clipboardFallback, 0, 3);
+        optionGrid.Controls.Add(_autoHealKeyboardHook, 1, 3);
+        optionGrid.Controls.Add(_darkTheme, 0, 4);
         layout.Controls.Add(optionGrid, 0, 1);
 
         var pauseButtons = new FlowLayoutPanel
@@ -2667,7 +2691,7 @@ internal sealed class SettingsForm : Form
 
     private TabPage CreateSettingsTab()
     {
-        var page = new TabPage("Настройки");
+        var page = new TabPage("Настройки") { AutoScroll = true };
         var layout = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
@@ -2676,7 +2700,7 @@ internal sealed class SettingsForm : Form
             ColumnCount = 1,
         };
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 210));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 238));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 22));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
@@ -2726,8 +2750,8 @@ internal sealed class SettingsForm : Form
             Dock = DockStyle.Fill,
             FlowDirection = FlowDirection.LeftToRight,
         };
-        ConfigureButton(_saveHotkeysButton, "Сохранить клавиши", 200);
-        ConfigureButton(_resetHotkeysButton, "Вернуть стандартные", 210);
+        ConfigureButton(_saveHotkeysButton, "Сохранить клавиши", 260);
+        ConfigureButton(_resetHotkeysButton, "Вернуть стандартные", 290);
         hotkeyButtons.Controls.Add(_saveHotkeysButton);
         hotkeyButtons.Controls.Add(_resetHotkeysButton);
         layout.Controls.Add(hotkeyButtons, 0, 2);
@@ -2948,13 +2972,14 @@ internal sealed class SettingsForm : Form
         {
             Dock = DockStyle.Fill,
             Padding = new Padding(14),
-            RowCount = 4,
+            RowCount = 5,
             ColumnCount = 1,
         };
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 72));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 46));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 76));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 52));
         page.Controls.Add(layout);
 
         layout.Controls.Add(new Label
@@ -2970,11 +2995,11 @@ internal sealed class SettingsForm : Form
             ColumnCount = 5,
             RowCount = 1,
         };
-        filterBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 58));
+        filterBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 76));
         filterBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        filterBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 82));
-        filterBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 170));
-        filterBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 112));
+        filterBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 104));
+        filterBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 190));
+        filterBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 126));
         filterBar.Controls.Add(new Label
         {
             Text = "Поиск",
@@ -3005,21 +3030,32 @@ internal sealed class SettingsForm : Form
         layout.Controls.Add(filterBar, 0, 1);
 
         _decisionLog.Dock = DockStyle.Fill;
-        _decisionLog.HorizontalScrollbar = true;
+        _decisionLog.HorizontalScrollbar = false;
+        _decisionLog.IntegralHeight = false;
         layout.Controls.Add(_decisionLog, 0, 2);
+
+        _decisionDetails.Dock = DockStyle.Fill;
+        _decisionDetails.Multiline = true;
+        _decisionDetails.ReadOnly = true;
+        _decisionDetails.ScrollBars = ScrollBars.Vertical;
+        _decisionDetails.WordWrap = true;
+        _decisionDetails.BackColor = Color.FromArgb(248, 250, 252);
+        _decisionDetails.ForeColor = Color.FromArgb(51, 65, 85);
+        _decisionDetails.PlaceholderText = "Выберите строку — здесь полностью отобразятся слово, преобразование и причина решения.";
+        layout.Controls.Add(_decisionDetails, 0, 3);
 
         var buttons = new FlowLayoutPanel
         {
             Dock = DockStyle.Fill,
             FlowDirection = FlowDirection.LeftToRight,
         };
-        ConfigureButton(_alwaysCorrectDecisionButton, "Всегда исправлять так", 220);
-        ConfigureButton(_neverCorrectDecisionButton, "Никогда не исправлять", 220);
-        ConfigureButton(_clearDecisionLogButton, "Очистить журнал", 170);
+        ConfigureButton(_alwaysCorrectDecisionButton, "Всегда исправлять так", 300);
+        ConfigureButton(_neverCorrectDecisionButton, "Никогда не исправлять", 300);
+        ConfigureButton(_clearDecisionLogButton, "Очистить журнал", 220);
         buttons.Controls.Add(_alwaysCorrectDecisionButton);
         buttons.Controls.Add(_neverCorrectDecisionButton);
         buttons.Controls.Add(_clearDecisionLogButton);
-        layout.Controls.Add(buttons, 0, 3);
+        layout.Controls.Add(buttons, 0, 4);
         return page;
     }
 
@@ -3341,6 +3377,7 @@ internal sealed class SettingsForm : Form
         _hotkeysLabel.Text =
             $"{_context.Settings.ConvertWordHotkey} - конвертировать текущее/последнее слово\r\n" +
             $"{_context.Settings.ConvertSelectionHotkey} - конвертировать выделенный текст\r\n" +
+            $"{_context.Settings.ConvertLineHotkey} - конвертировать последние {_context.Settings.ConvertRecentWordCount} слов\r\n" +
             $"{_context.Settings.UndoHotkey} - откатить последнее автоисправление\r\n" +
             $"{_context.Settings.PauseHotkey} - включить или выключить паузу";
     }
@@ -3601,6 +3638,7 @@ internal sealed class SettingsForm : Form
     private void UpdateDecisionButtons()
     {
         var selected = _decisionLog.SelectedItem as DecisionLogItem;
+        _decisionDetails.Text = selected?.ToString() ?? "";
         _alwaysCorrectDecisionButton.Enabled = selected is not null
             && AutoReplacementRule.IsValidText(selected.Original)
             && AutoReplacementRule.IsValidText(selected.Corrected);
@@ -5143,10 +5181,12 @@ internal sealed record DecisionLogItem
 
     public override string ToString()
     {
-        var action = Applied ? "исправлено" : "пропущено";
+        var action = Applied ? "исправлено" : "не изменено";
         var pair = string.IsNullOrWhiteSpace(Corrected)
             ? Original
-            : $"{Original} -> {Corrected}";
+            : Applied
+                ? $"{Original} -> {Corrected}"
+                : $"{Original} [кандидат: {Corrected}]";
         return $"{Timestamp:HH:mm:ss} {Kind} ({action}): {pair}. {Reason}";
     }
 }
