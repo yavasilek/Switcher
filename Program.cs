@@ -2239,6 +2239,7 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
 internal sealed class SettingsForm : Form
 {
     private readonly SwitcherApplicationContext _context;
+    private readonly Icon _windowIcon = TrayIconFactory.Create();
     private readonly TabControl _tabs = new();
     private TabPage? _installTab;
     private readonly Label _statusLabel = new();
@@ -2307,6 +2308,9 @@ internal sealed class SettingsForm : Form
     {
         _context = context;
         Text = "Switcher";
+        Icon = _windowIcon;
+        ShowIcon = true;
+        FormClosed += (_, _) => _windowIcon.Dispose();
         StartPosition = FormStartPosition.CenterScreen;
         AutoScaleMode = AutoScaleMode.Dpi;
         MinimumSize = new Size(980, 700);
