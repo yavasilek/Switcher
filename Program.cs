@@ -146,6 +146,7 @@ internal static class SelfTest
         CheckDownloadProgress(failures);
         FeaturePackSelfTests.Run(failures);
         CheckDecisionLogFormatting(failures);
+        CheckLatinPreferredFields(failures);
 
         if (failures.Count == 0)
         {
@@ -179,6 +180,17 @@ internal static class SelfTest
             || text.Contains("по -> gj", StringComparison.Ordinal))
         {
             failures.Add("DECISION LOG: skipped candidate looks like an applied correction");
+        }
+    }
+
+    private static void CheckLatinPreferredFields(List<string> failures)
+    {
+        if (!NativeMethods.IsLatinPreferredMetadata("Address and search bar omnibox")
+            || !NativeMethods.IsLatinPreferredMetadata("Email address")
+            || NativeMethods.IsLatinPreferredMetadata("Поиск по сайту")
+            || NativeMethods.IsLatinPreferredMetadata("Search products"))
+        {
+            failures.Add("CONTEXT FIELDS: site search must not force the English layout");
         }
     }
 
@@ -1927,7 +1939,7 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         if (_settings.ForceLatinInWebFields && NativeMethods.IsForegroundLatinPreferredField())
         {
             target = KeyboardLayout.English;
-            reason = "контекст поля URL/email/search";
+            reason = "контекст адресной строки или email-поля";
         }
         else if (_settings.EnableApplicationLayoutRules)
         {
@@ -2187,7 +2199,7 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         builder.AppendLine($"Тёмная тема: {(_settings.DarkTheme ? "включена" : "выключена")}");
         builder.AppendLine($"Память раскладки окон: {(_settings.EnableWindowLayoutMemory ? "включена" : "выключена")}, окон: {_windowLayouts.Count}");
         builder.AppendLine($"Правила приложений: {(_settings.EnableApplicationLayoutRules ? _settings.ApplicationLayoutRules.Count : 0)}");
-        builder.AppendLine($"Latin для URL/email/search: {(_settings.ForceLatinInWebFields ? "включен" : "выключен")}");
+        builder.AppendLine($"Latin для адресных строк и email: {(_settings.ForceLatinInWebFields ? "включен" : "выключен")}");
         builder.AppendLine($"Esc-откат: {(_settings.EscapeUndo ? "включен" : "выключен")}");
         builder.AppendLine($"CapsLock-переключение: {(_settings.CapsLockSwitch ? "включено" : "выключено")}");
         builder.AppendLine($"Сниппеты: {(_settings.EnableSnippets ? _settings.Snippets.Count : 0)}");
@@ -2804,7 +2816,7 @@ internal sealed class SettingsForm : Form
 
         var memory = new CheckBox { AutoSize = true, Text = "Запоминать раскладку каждого окна", Checked = _context.Settings.EnableWindowLayoutMemory };
         var appRulesEnabled = new CheckBox { AutoSize = true, Text = "Применять правила раскладки приложений", Checked = _context.Settings.EnableApplicationLayoutRules };
-        var latinFields = new CheckBox { AutoSize = true, Text = "Включать EN в полях URL, email и поиска", Checked = _context.Settings.ForceLatinInWebFields };
+        var latinFields = new CheckBox { AutoSize = true, Text = "Включать EN только в адресных строках и email-полях", Checked = _context.Settings.ForceLatinInWebFields };
         var escapeUndo = new CheckBox { AutoSize = true, Text = "Esc отменяет последнее исправление и запоминает отказ", Checked = _context.Settings.EscapeUndo };
         var caps = new CheckBox { AutoSize = true, Text = "CapsLock переключает RU/EN", Checked = _context.Settings.CapsLockSwitch };
         var snippetsEnabled = new CheckBox { AutoSize = true, Text = "Включить многострочные сниппеты", Checked = _context.Settings.EnableSnippets };
@@ -7105,14 +7117,20 @@ internal static class NativeMethods
                 return false;
             }
 
-            var metadata = string.Join(" ", element.CurrentName, element.CurrentAutomationId, element.CurrentClassName).ToLowerInvariant();
-            return new[] { "address", "omnibox", "url", "email", "e-mail", "search", "адрес", "почт", "поиск" }
-                .Any(marker => metadata.Contains(marker, StringComparison.Ordinal));
+            var metadata = string.Join(" ", element.CurrentName, element.CurrentAutomationId, element.CurrentClassName);
+            return IsLatinPreferredMetadata(metadata);
         }
         catch
         {
             return false;
         }
+    }
+
+    internal static bool IsLatinPreferredMetadata(string? metadata)
+    {
+        var normalized = (metadata ?? "").ToLowerInvariant();
+        return new[] { "address", "omnibox", "url", "email", "e-mail", "адрес", "почт" }
+            .Any(marker => normalized.Contains(marker, StringComparison.Ordinal));
     }
 
     public static string GetForegroundProcessName()
