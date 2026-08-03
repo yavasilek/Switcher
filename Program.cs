@@ -144,6 +144,7 @@ internal static class SelfTest
         CheckInputSize(failures);
         CheckInputSenderModifierRelease(failures);
         CheckDownloadProgress(failures);
+        FeaturePackSelfTests.Run(failures);
 
         if (failures.Count == 0)
         {
@@ -307,6 +308,12 @@ internal static class SelfTest
                 CustomAutoReplacements = [new AutoReplacementRule { Original = "ghbdtn", Corrected = "привет", Enabled = false }],
                 DecisionLog = [new DecisionLogItem { Original = "ghbdtn", Corrected = "привет", Reason = "test" }],
                 ConvertWordHotkey = new HotkeyBinding { Ctrl = true, Alt = false, Key = Keys.F8 },
+                EnableWindowLayoutMemory = true,
+                ForceLatinInWebFields = true,
+                CapsLockSwitch = true,
+                ConvertRecentWordCount = 6,
+                ApplicationLayoutRules = [new ApplicationLayoutRule("chrome", ContextLayout.English)],
+                Snippets = [new SnippetRule("sig", "Best regards,\nAlex")],
             };
 
             SettingsStore.SaveToFile(settings, path);
@@ -352,6 +359,13 @@ internal static class SelfTest
             if (loaded.ConvertWordHotkey.Key != Keys.F8 || !loaded.ConvertWordHotkey.Ctrl || loaded.ConvertWordHotkey.Alt)
             {
                 failures.Add($"SETTINGS roundtrip: hotkey was not preserved, actual {loaded.ConvertWordHotkey}");
+            }
+
+            if (!loaded.CapsLockSwitch || loaded.ConvertRecentWordCount != 6
+                || loaded.ApplicationLayoutRules.SingleOrDefault()?.Layout != ContextLayout.English
+                || loaded.Snippets.SingleOrDefault()?.Replacement != "Best regards,\nAlex")
+            {
+                failures.Add("SETTINGS roundtrip: context feature settings were not preserved");
             }
 
             if (loaded.LastUpdateCheckUtc != settings.LastUpdateCheckUtc
@@ -483,6 +497,7 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
     private readonly System.Windows.Forms.Timer _updateCheckTimer = new();
     private readonly StringBuilder _currentWord = new();
     private readonly DiagnosticState _diagnostics = new();
+    private readonly Dictionary<IntPtr, KeyboardLayout> _windowLayouts = [];
     private SettingsForm? _settingsForm;
     private ForegroundFocusKey _passwordDetectionKey;
     private PasswordFieldDetection _passwordDetection = PasswordFieldDetection.NotChecked;
@@ -493,6 +508,9 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
     private bool _updateCheckInProgress;
     private DateTime? _pauseUntilUtc;
     private string? _lastExternalProcessName;
+    private IntPtr _lastForegroundWindow;
+    private KeyboardLayout? _lastObservedLayout;
+    private DateTime _lastTrayRefreshUtc;
     private AppSettings _settings;
 
     public SwitcherApplicationContext()
@@ -512,7 +530,12 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
 
         _keyboardHook = new KeyboardHook(HandleKeyDown);
         _healthTimer.Interval = 60000;
-        _healthTimer.Tick += (_, _) => CheckHookHealth();
+        _healthTimer.Tick += (_, _) =>
+        {
+            CheckHookHealth();
+            ApplyForegroundContextPolicy();
+            RefreshTrayState(force: true);
+        };
         _healthTimer.Start();
         _updateCheckTimer.Interval = (int)UpdateCheckTimerInterval.TotalMilliseconds;
         _updateCheckTimer.Tick += (_, _) => _ = CheckForUpdatesInBackgroundAsync();
@@ -707,6 +730,11 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
             Name = "ConvertSelectionHotkey",
             Enabled = false,
         };
+        var convertLineItem = new ToolStripMenuItem
+        {
+            Name = "ConvertLineHotkey",
+            Enabled = false,
+        };
         var undoItem = new ToolStripMenuItem
         {
             Name = "UndoHotkey",
@@ -732,6 +760,7 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
             new ToolStripSeparator(),
             convertItem,
             convertSelectionItem,
+            convertLineItem,
             undoItem,
             pauseHotkeyItem,
             new ToolStripSeparator(),
@@ -814,6 +843,11 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
             convertSelectionItem.Text = $"Конвертировать выделенный текст: {_settings.ConvertSelectionHotkey}";
         }
 
+        if (menu.Items["ConvertLineHotkey"] is ToolStripMenuItem convertLineItem)
+        {
+            convertLineItem.Text = $"Конвертировать последние {_settings.ConvertRecentWordCount} слов: {_settings.ConvertLineHotkey}";
+        }
+
         if (menu.Items["UndoHotkey"] is ToolStripMenuItem undoItem)
         {
             undoItem.Text = $"Откатить автоисправление: {_settings.UndoHotkey}";
@@ -851,6 +885,7 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         _diagnostics.LastKey = $"{key} / scan {scanCode}";
         _diagnostics.CurrentWord = _currentWord.ToString();
         TrackForegroundProcess();
+        RefreshTrayState();
 
         if (KeyboardState.Matches(_settings.PauseHotkey, key))
         {
@@ -885,10 +920,25 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
             return false;
         }
 
+        ApplyForegroundContextPolicy();
+
+        if (_settings.EscapeUndo && key == Keys.Escape && _lastCorrection is not null)
+        {
+            SetDiagnosticDecision("Esc: откат последнего автоисправления и обучение исключению");
+            PostToUi(() => UndoLastCorrection(learnRejection: true));
+            return true;
+        }
+
+        if (_settings.CapsLockSwitch && key == Keys.CapsLock)
+        {
+            PostToUi(SwitchLayoutWithCapsLock);
+            return true;
+        }
+
         if (KeyboardState.Matches(_settings.UndoHotkey, key))
         {
             SetDiagnosticDecision($"Горячая клавиша отката: {key}");
-            PostToUi(UndoLastCorrection);
+            PostToUi(() => UndoLastCorrection());
             return true;
         }
 
@@ -903,6 +953,13 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         {
             SetDiagnosticDecision($"Горячая клавиша выделенного текста: {key}");
             PostToUi(ConvertSelectedTextManually);
+            return true;
+        }
+
+        if (KeyboardState.Matches(_settings.ConvertLineHotkey, key))
+        {
+            SetDiagnosticDecision($"Горячая клавиша конвертации строки: {key}");
+            PostToUi(ConvertRecentWordsManually);
             return true;
         }
 
@@ -967,6 +1024,14 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         _diagnostics.LastWord = word;
         _diagnostics.CurrentWord = "";
 
+        var snippet = _settings.Snippets.FirstOrDefault(rule => rule.Enabled && string.Equals(rule.Trigger, word, StringComparison.OrdinalIgnoreCase));
+        if (_settings.EnableSnippets && snippet is not null)
+        {
+            SetDiagnosticDecision($"Сниппет: {snippet.Trigger}");
+            PostToUi(() => ExpandSnippet(word, delimiter, snippet));
+            return true;
+        }
+
         if (!_settings.AutoSwitch)
         {
             SetDiagnosticDecision($"Авто выключено, слово: {word}");
@@ -1020,6 +1085,63 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         AddDecisionLog("Авто", originalWord, correction.Text, $"{reason}; ввод: {inputMethod}", applied: true);
         PlaySwitchSound(correction.Direction);
         UpdateBalloon("Автозамена", $"{originalText} -> {correctedText} ({inputMethod})");
+    }
+
+    private void ExpandSnippet(string trigger, string delimiter, SnippetRule snippet)
+    {
+        var replacement = snippet.Replacement + delimiter;
+        if (!InputSender.ReplaceText(trigger.Length, replacement))
+        {
+            PlayErrorSound();
+            UpdateBalloon("Сниппет", "Windows заблокировала подстановку текста");
+            return;
+        }
+
+        ResetTypingState();
+        AddHistory("Сниппет", trigger + delimiter, replacement);
+        AddDecisionLog("Сниппет", trigger, TrimForStatus(snippet.Replacement), "многострочная подстановка", applied: true);
+    }
+
+    private void SwitchLayoutWithCapsLock()
+    {
+        var current = NativeMethods.GetForegroundLayout();
+        var target = current == KeyboardLayout.Russian ? KeyboardLayout.English : KeyboardLayout.Russian;
+        StoreLayoutSwitch(NativeMethods.SwitchForegroundLayout(target));
+        ResetTypingState();
+        RefreshTrayState(force: true);
+    }
+
+    private void ConvertRecentWordsManually()
+    {
+        using var clipboard = ClipboardBackup.Capture();
+        var count = Math.Clamp(_settings.ConvertRecentWordCount, 1, 20);
+        for (var i = 0; i < count; i++)
+        {
+            InputSender.SendChord(Keys.ControlKey, Keys.ShiftKey, Keys.Left);
+            Thread.Sleep(25);
+        }
+
+        Clipboard.Clear();
+        InputSender.SendChord(Keys.ControlKey, Keys.C);
+        var selectedText = ClipboardBackup.WaitForText(TimeSpan.FromMilliseconds(350));
+        if (string.IsNullOrWhiteSpace(selectedText) || !TextHeuristics.TryConvertText(selectedText, out var correction))
+        {
+            InputSender.SendKey(Keys.Right);
+            clipboard.Restore();
+            PlayErrorSound();
+            UpdateBalloon("Конвертация строки", "подходящий текст не найден");
+            return;
+        }
+
+        StoreLayoutSwitch(NativeMethods.SwitchForegroundLayout(correction.TargetLayout));
+        Clipboard.SetText(correction.Text, TextDataFormat.UnicodeText);
+        InputSender.SendChord(Keys.ControlKey, Keys.V);
+        Thread.Sleep(120);
+        clipboard.Restore();
+        ResetTypingState();
+        AddHistory("Строка", selectedText, correction.Text);
+        AddDecisionLog("Строка", TrimForStatus(selectedText), TrimForStatus(correction.Text), $"конвертация последних слов: {count}", applied: true);
+        PlaySwitchSound(correction.Direction);
     }
 
     private void ConvertRecentWordManually()
@@ -1194,7 +1316,7 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         UpdateBalloon("Выделенный текст", $"{TrimForStatus(selectedText)} -> {TrimForStatus(correction.Text)}");
     }
 
-    private void UndoLastCorrection()
+    private void UndoLastCorrection(bool learnRejection = false)
     {
         if (_lastCorrection is null)
         {
@@ -1213,6 +1335,16 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         _lastCorrection = null;
         _lastTypedSegment = null;
         _currentWord.Clear();
+        if (learnRejection)
+        {
+            var rejected = correction.OriginalText.Trim();
+            if (AutoReplacementRule.IsValidText(rejected)
+                && !_settings.CustomNeverCorrectWords.Contains(rejected, StringComparer.OrdinalIgnoreCase))
+            {
+                _settings.CustomNeverCorrectWords.Insert(0, rejected);
+                SettingsStore.Save(_settings);
+            }
+        }
         AddHistory("Откат", correction.CorrectedText, correction.OriginalText);
         PlayErrorSound();
         UpdateBalloon("Откат", $"{correction.OriginalText.TrimEnd()} ({inputMethod})");
@@ -1739,6 +1871,89 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         }
     }
 
+    private void ApplyForegroundContextPolicy()
+    {
+        if (!_settings.EnableWindowLayoutMemory && !_settings.EnableApplicationLayoutRules && !_settings.ForceLatinInWebFields)
+        {
+            return;
+        }
+
+        if (IsForegroundProcessExcluded(out _) || (_settings.IgnorePasswordFields && DetectForegroundPasswordField().IsPassword))
+        {
+            return;
+        }
+
+        var focus = NativeMethods.GetForegroundFocusKey();
+        if (focus.ForegroundWindow == IntPtr.Zero)
+        {
+            return;
+        }
+
+        var current = NativeMethods.GetForegroundLayout();
+        if (_lastForegroundWindow != IntPtr.Zero && _lastObservedLayout is { } observed)
+        {
+            _windowLayouts[_lastForegroundWindow] = observed;
+        }
+
+        var changedWindow = focus.ForegroundWindow != _lastForegroundWindow;
+        _lastForegroundWindow = focus.ForegroundWindow;
+        _lastObservedLayout = current;
+
+        KeyboardLayout? target = null;
+        var reason = "";
+        if (_settings.ForceLatinInWebFields && NativeMethods.IsForegroundLatinPreferredField())
+        {
+            target = KeyboardLayout.English;
+            reason = "контекст поля URL/email/search";
+        }
+        else if (_settings.EnableApplicationLayoutRules)
+        {
+            var process = NativeMethods.GetForegroundProcessName();
+            var rule = _settings.ApplicationLayoutRules.FirstOrDefault(candidate => string.Equals(candidate.ProcessName, process, StringComparison.OrdinalIgnoreCase));
+            if (rule?.Layout == ContextLayout.Russian)
+            {
+                target = KeyboardLayout.Russian;
+                reason = $"правило приложения {process}=RU";
+            }
+            else if (rule?.Layout == ContextLayout.English)
+            {
+                target = KeyboardLayout.English;
+                reason = $"правило приложения {process}=EN";
+            }
+        }
+
+        if (target is null && changedWindow && _settings.EnableWindowLayoutMemory && _windowLayouts.TryGetValue(focus.ForegroundWindow, out var remembered))
+        {
+            target = remembered;
+            reason = "память раскладки окна";
+        }
+
+        if (target is not null && current != target)
+        {
+            var result = NativeMethods.SwitchForegroundLayout(target.Value);
+            StoreLayoutSwitch(result);
+            _lastObservedLayout = target;
+            SetDiagnosticDecision($"Контекст: {reason}");
+        }
+    }
+
+    private void RefreshTrayState(bool force = false)
+    {
+        if (!force && DateTime.UtcNow - _lastTrayRefreshUtc < TimeSpan.FromMilliseconds(250))
+        {
+            return;
+        }
+
+        _lastTrayRefreshUtc = DateTime.UtcNow;
+        var layout = NativeMethods.GetForegroundLayout();
+        var paused = IsPaused(out _) || IsForegroundProcessExcluded(out _);
+        var old = _notifyIcon.Icon;
+        _notifyIcon.Icon = TrayIconFactory.Create(layout, paused);
+        var tooltip = $"Switcher — {(layout == KeyboardLayout.Russian ? "RU" : "EN")} — {CurrentStatus}";
+        _notifyIcon.Text = tooltip[..Math.Min(63, tooltip.Length)];
+        old?.Dispose();
+    }
+
     private static bool IsOwnProcess(string processName)
     {
         return string.Equals(processName, Process.GetCurrentProcess().ProcessName, StringComparison.OrdinalIgnoreCase)
@@ -1947,6 +2162,12 @@ internal sealed class SwitcherApplicationContext : ApplicationContext
         builder.AppendLine($"Clipboard fallback: {(_settings.ClipboardFallback ? "включен" : "выключен")}");
         builder.AppendLine($"Автовосстановление hook: {(_settings.AutoHealKeyboardHook ? "включено" : "выключено")}");
         builder.AppendLine($"Тёмная тема: {(_settings.DarkTheme ? "включена" : "выключена")}");
+        builder.AppendLine($"Память раскладки окон: {(_settings.EnableWindowLayoutMemory ? "включена" : "выключена")}, окон: {_windowLayouts.Count}");
+        builder.AppendLine($"Правила приложений: {(_settings.EnableApplicationLayoutRules ? _settings.ApplicationLayoutRules.Count : 0)}");
+        builder.AppendLine($"Latin для URL/email/search: {(_settings.ForceLatinInWebFields ? "включен" : "выключен")}");
+        builder.AppendLine($"Esc-откат: {(_settings.EscapeUndo ? "включен" : "выключен")}");
+        builder.AppendLine($"CapsLock-переключение: {(_settings.CapsLockSwitch ? "включено" : "выключено")}");
+        builder.AppendLine($"Сниппеты: {(_settings.EnableSnippets ? _settings.Snippets.Count : 0)}");
         return builder.ToString();
     }
 
@@ -2014,6 +2235,7 @@ internal sealed class SettingsForm : Form
     private readonly ComboBox _enToRuSound = new();
     private readonly ComboBox _ruToEnSound = new();
     private readonly Label _hotkeysLabel = new();
+    private readonly HotkeyRow _convertLineHotkey = new("Последние несколько слов");
     private readonly HotkeyRow _convertWordHotkey = new("Текущее или последнее слово");
     private readonly HotkeyRow _convertSelectionHotkey = new("Выделенный текст");
     private readonly HotkeyRow _undoHotkey = new("Откат автозамены");
@@ -2096,6 +2318,7 @@ internal sealed class SettingsForm : Form
         _tabs.Dock = DockStyle.Fill;
         _tabs.Multiline = true;
         _tabs.TabPages.Add(CreateGeneralTab());
+        _tabs.TabPages.Add(CreateContextTab());
         _tabs.TabPages.Add(CreateListsTab());
         _tabs.TabPages.Add(CreateReplacementsTab());
         _tabs.TabPages.Add(CreateSettingsTab());
@@ -2143,6 +2366,7 @@ internal sealed class SettingsForm : Form
         SetComboValue(_ruToEnSound, _context.Settings.RuToEnSound);
         _convertWordHotkey.SetBinding(_context.Settings.ConvertWordHotkey);
         _convertSelectionHotkey.SetBinding(_context.Settings.ConvertSelectionHotkey);
+        _convertLineHotkey.SetBinding(_context.Settings.ConvertLineHotkey);
         _undoHotkey.SetBinding(_context.Settings.UndoHotkey);
         _pauseHotkey.SetBinding(_context.Settings.PauseHotkey);
         _excludedProcesses.Text = LinesFrom(_context.Settings.ExcludedProcesses);
@@ -2473,14 +2697,14 @@ internal sealed class SettingsForm : Form
         {
             Dock = DockStyle.Fill,
             ColumnCount = 5,
-            RowCount = 5,
+            RowCount = 6,
         };
         hotkeyGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 280));
         hotkeyGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 70));
         hotkeyGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 70));
         hotkeyGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 70));
         hotkeyGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        for (var row = 0; row < 5; row++)
+        for (var row = 0; row < 6; row++)
         {
             hotkeyGrid.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
         }
@@ -2492,8 +2716,9 @@ internal sealed class SettingsForm : Form
         AddHeader(hotkeyGrid, 4, "Клавиша");
         _convertWordHotkey.AddTo(hotkeyGrid, 1);
         _convertSelectionHotkey.AddTo(hotkeyGrid, 2);
-        _undoHotkey.AddTo(hotkeyGrid, 3);
-        _pauseHotkey.AddTo(hotkeyGrid, 4);
+        _convertLineHotkey.AddTo(hotkeyGrid, 3);
+        _undoHotkey.AddTo(hotkeyGrid, 4);
+        _pauseHotkey.AddTo(hotkeyGrid, 5);
         layout.Controls.Add(hotkeyGrid, 0, 1);
 
         var hotkeyButtons = new FlowLayoutPanel
@@ -2535,6 +2760,72 @@ internal sealed class SettingsForm : Form
             ForeColor = Color.FromArgb(71, 85, 105),
         }, 0, 6);
 
+        return page;
+    }
+
+    private TabPage CreateContextTab()
+    {
+        var page = new TabPage("Контекст+") { AutoScroll = true, Padding = new Padding(14) };
+        var layout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            ColumnCount = 1,
+            RowCount = 0,
+        };
+
+        var memory = new CheckBox { AutoSize = true, Text = "Запоминать раскладку каждого окна", Checked = _context.Settings.EnableWindowLayoutMemory };
+        var appRulesEnabled = new CheckBox { AutoSize = true, Text = "Применять правила раскладки приложений", Checked = _context.Settings.EnableApplicationLayoutRules };
+        var latinFields = new CheckBox { AutoSize = true, Text = "Включать EN в полях URL, email и поиска", Checked = _context.Settings.ForceLatinInWebFields };
+        var escapeUndo = new CheckBox { AutoSize = true, Text = "Esc отменяет последнее исправление и запоминает отказ", Checked = _context.Settings.EscapeUndo };
+        var caps = new CheckBox { AutoSize = true, Text = "CapsLock переключает RU/EN", Checked = _context.Settings.CapsLockSwitch };
+        var snippetsEnabled = new CheckBox { AutoSize = true, Text = "Включить многострочные сниппеты", Checked = _context.Settings.EnableSnippets };
+        foreach (var control in new Control[] { memory, appRulesEnabled, latinFields, escapeUndo, caps, snippetsEnabled })
+        {
+            layout.Controls.Add(control);
+        }
+
+        layout.Controls.Add(new Label { AutoSize = true, Margin = new Padding(3, 14, 3, 3), Text = "Правила приложений — по одному на строку: chrome=EN, telegram=RU" });
+        var rules = new TextBox { Multiline = true, ScrollBars = ScrollBars.Vertical, Width = 760, Height = 105, Text = string.Join(Environment.NewLine, _context.Settings.ApplicationLayoutRules) };
+        layout.Controls.Add(rules);
+
+        layout.Controls.Add(new Label { AutoSize = true, Margin = new Padding(3, 14, 3, 3), Text = "Сниппеты: триггер => текст. Для новой строки используйте \\n" });
+        var snippets = new TextBox { Multiline = true, ScrollBars = ScrollBars.Both, WordWrap = false, Width = 760, Height = 125, Text = string.Join(Environment.NewLine, _context.Settings.Snippets) };
+        layout.Controls.Add(snippets);
+
+        var wordsPanel = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.LeftToRight };
+        wordsPanel.Controls.Add(new Label { AutoSize = true, Margin = new Padding(3, 8, 6, 3), Text = "Конвертировать последних слов:" });
+        var wordCount = new NumericUpDown { Minimum = 1, Maximum = 20, Value = _context.Settings.ConvertRecentWordCount, Width = 60 };
+        wordsPanel.Controls.Add(wordCount);
+        wordsPanel.Controls.Add(new Label { AutoSize = true, Margin = new Padding(10, 8, 3, 3), Text = $"Горячая клавиша: {_context.Settings.ConvertLineHotkey}" });
+        layout.Controls.Add(wordsPanel);
+
+        var save = new Button { AutoSize = true, Text = "Сохранить контекстные настройки", Margin = new Padding(3, 14, 3, 3) };
+        save.Click += (_, _) =>
+        {
+            _context.UpdateSettings(settings =>
+            {
+                settings.EnableWindowLayoutMemory = memory.Checked;
+                settings.EnableApplicationLayoutRules = appRulesEnabled.Checked;
+                settings.ForceLatinInWebFields = latinFields.Checked;
+                settings.EscapeUndo = escapeUndo.Checked;
+                settings.CapsLockSwitch = caps.Checked;
+                settings.EnableSnippets = snippetsEnabled.Checked;
+                settings.ConvertRecentWordCount = (int)wordCount.Value;
+                settings.ApplicationLayoutRules = ApplicationLayoutRule.Parse(ParseLines(rules.Text));
+                settings.Snippets = SnippetRule.Parse(ParseLines(snippets.Text));
+            });
+            MessageBox.Show(this, "Контекстные настройки сохранены.", "Switcher", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        };
+        layout.Controls.Add(save);
+        layout.Controls.Add(new Label
+        {
+            AutoSize = true,
+            MaximumSize = new Size(780, 0),
+            Margin = new Padding(3, 16, 3, 3),
+            Text = "Источники идей: KeyboardSwitcher — память окон и Esc-откат; Mahou — CapsLock, строки и сниппеты; Kright — правила приложений и контекст полей.",
+        });
+        page.Controls.Add(layout);
         return page;
     }
 
@@ -3060,6 +3351,7 @@ internal sealed class SettingsForm : Form
         {
             _convertWordHotkey.Binding,
             _convertSelectionHotkey.Binding,
+            _convertLineHotkey.Binding,
             _undoHotkey.Binding,
             _pauseHotkey.Binding,
         };
@@ -3090,6 +3382,7 @@ internal sealed class SettingsForm : Form
         {
             s.ConvertWordHotkey = _convertWordHotkey.Binding;
             s.ConvertSelectionHotkey = _convertSelectionHotkey.Binding;
+            s.ConvertLineHotkey = _convertLineHotkey.Binding;
             s.UndoHotkey = _undoHotkey.Binding;
             s.PauseHotkey = _pauseHotkey.Binding;
         });
@@ -3101,6 +3394,7 @@ internal sealed class SettingsForm : Form
         {
             s.ConvertWordHotkey = AppSettings.DefaultConvertWordHotkey();
             s.ConvertSelectionHotkey = AppSettings.DefaultConvertSelectionHotkey();
+            s.ConvertLineHotkey = AppSettings.DefaultConvertLineHotkey();
             s.UndoHotkey = AppSettings.DefaultUndoHotkey();
             s.PauseHotkey = AppSettings.DefaultPauseHotkey();
         });
@@ -4445,6 +4739,7 @@ internal sealed record AppSettings
     public static HotkeyBinding DefaultConvertSelectionHotkey() => HotkeyBinding.CtrlAlt(Keys.Enter);
     public static HotkeyBinding DefaultUndoHotkey() => HotkeyBinding.CtrlAlt(Keys.Back);
     public static HotkeyBinding DefaultPauseHotkey() => HotkeyBinding.CtrlAlt(Keys.P);
+    public static HotkeyBinding DefaultConvertLineHotkey() => HotkeyBinding.CtrlAlt(Keys.L);
 
     public bool AutoSwitch { get; set; } = true;
     public bool Paused { get; set; }
@@ -4456,6 +4751,12 @@ internal sealed record AppSettings
     public bool ClipboardFallback { get; set; } = true;
     public bool AutoHealKeyboardHook { get; set; } = true;
     public bool IgnorePasswordFields { get; set; } = true;
+    public bool EscapeUndo { get; set; } = true;
+    public bool CapsLockSwitch { get; set; }
+    public bool EnableSnippets { get; set; } = true;
+    public bool EnableWindowLayoutMemory { get; set; } = true;
+    public bool EnableApplicationLayoutRules { get; set; } = true;
+    public bool ForceLatinInWebFields { get; set; } = true;
     public bool DarkTheme { get; set; }
     public bool FirstRunHintShown { get; set; }
     public CorrectionProfile CorrectionProfile { get; set; } = CorrectionProfile.Balanced;
@@ -4471,6 +4772,8 @@ internal sealed record AppSettings
     public HotkeyBinding ConvertSelectionHotkey { get; set; } = DefaultConvertSelectionHotkey();
     public HotkeyBinding UndoHotkey { get; set; } = DefaultUndoHotkey();
     public HotkeyBinding PauseHotkey { get; set; } = DefaultPauseHotkey();
+    public HotkeyBinding ConvertLineHotkey { get; set; } = DefaultConvertLineHotkey();
+    public int ConvertRecentWordCount { get; set; } = 8;
     public List<string> ExcludedProcesses { get; set; } =
     [
         "1password",
@@ -4489,6 +4792,8 @@ internal sealed record AppSettings
     public List<string> CustomEnglishWords { get; set; } = [];
     public List<string> CustomNeverCorrectWords { get; set; } = [];
     public List<AutoReplacementRule> CustomAutoReplacements { get; set; } = [];
+    public List<ApplicationLayoutRule> ApplicationLayoutRules { get; set; } = [];
+    public List<SnippetRule> Snippets { get; set; } = [];
     public List<CorrectionHistoryItem> History { get; set; } = [];
     public List<DecisionLogItem> DecisionLog { get; set; } = [];
 }
@@ -4975,17 +5280,20 @@ internal static class SettingsStore
         settings.ConvertSelectionHotkey = HotkeyBinding.Normalize(settings.ConvertSelectionHotkey, AppSettings.DefaultConvertSelectionHotkey());
         settings.UndoHotkey = HotkeyBinding.Normalize(settings.UndoHotkey, AppSettings.DefaultUndoHotkey());
         settings.PauseHotkey = HotkeyBinding.Normalize(settings.PauseHotkey, AppSettings.DefaultPauseHotkey());
+        settings.ConvertLineHotkey = HotkeyBinding.Normalize(settings.ConvertLineHotkey, AppSettings.DefaultConvertLineHotkey());
         if (HotkeyBinding.HasDuplicates([
             settings.ConvertWordHotkey,
             settings.ConvertSelectionHotkey,
             settings.UndoHotkey,
             settings.PauseHotkey,
+            settings.ConvertLineHotkey,
         ]))
         {
             settings.ConvertWordHotkey = AppSettings.DefaultConvertWordHotkey();
             settings.ConvertSelectionHotkey = AppSettings.DefaultConvertSelectionHotkey();
             settings.UndoHotkey = AppSettings.DefaultUndoHotkey();
             settings.PauseHotkey = AppSettings.DefaultPauseHotkey();
+            settings.ConvertLineHotkey = AppSettings.DefaultConvertLineHotkey();
         }
 
         settings.ExcludedProcesses ??= [];
@@ -4993,6 +5301,8 @@ internal static class SettingsStore
         settings.CustomEnglishWords ??= [];
         settings.CustomNeverCorrectWords ??= [];
         settings.CustomAutoReplacements ??= [];
+        settings.ApplicationLayoutRules ??= [];
+        settings.Snippets ??= [];
         settings.History ??= [];
         settings.DecisionLog ??= [];
         settings.LastUpdateCheckMessage = NormalizeSingleLine(settings.LastUpdateCheckMessage);
@@ -5014,6 +5324,14 @@ internal static class SettingsStore
         settings.CustomEnglishWords = NormalizeList(settings.CustomEnglishWords);
         settings.CustomNeverCorrectWords = NormalizeList(settings.CustomNeverCorrectWords);
         settings.CustomAutoReplacements = AutoReplacementRule.Normalize(settings.CustomAutoReplacements);
+        settings.ApplicationLayoutRules = ApplicationLayoutRule.Parse(settings.ApplicationLayoutRules.Select(rule => rule.ToString()));
+        settings.Snippets = settings.Snippets
+            .Where(rule => SnippetRule.IsValidTrigger(rule.Trigger) && rule.Replacement.Length is > 0 and <= 4000)
+            .GroupBy(rule => rule.Trigger.Trim(), StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.Last() with { Trigger = group.Key })
+            .OrderBy(rule => rule.Trigger, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        settings.ConvertRecentWordCount = Math.Clamp(settings.ConvertRecentWordCount, 1, 20);
         if (settings.BuiltInReplacementsVersion < AutoReplacementDefaults.Version)
         {
             AutoReplacementDefaults.MergeInto(settings.CustomAutoReplacements);
@@ -5510,7 +5828,9 @@ internal sealed class ClipboardBackup : IDisposable
 
 internal static class TrayIconFactory
 {
-    public static Icon Create()
+    public static Icon Create() => Create(null, false);
+
+    public static Icon Create(KeyboardLayout? layout, bool paused)
     {
         var bitmap = new Bitmap(32, 32);
         using var graphics = Graphics.FromImage(bitmap);
@@ -5518,9 +5838,19 @@ internal static class TrayIconFactory
         using var background = new LinearGradientBrush(
             new Rectangle(0, 0, 32, 32),
             Color.FromArgb(24, 32, 43),
-            Color.FromArgb(15, 118, 110),
+            paused ? Color.FromArgb(107, 114, 128) : layout == KeyboardLayout.Russian ? Color.FromArgb(37, 99, 235) : Color.FromArgb(15, 118, 110),
             LinearGradientMode.ForwardDiagonal);
         graphics.FillEllipse(background, 1, 1, 30, 30);
+        if (layout is not null)
+        {
+            using var font = new Font("Segoe UI", 9F, FontStyle.Bold, GraphicsUnit.Pixel);
+            using var brush = new SolidBrush(Color.White);
+            var label = paused ? "||" : layout == KeyboardLayout.Russian ? "RU" : "EN";
+            var size = graphics.MeasureString(label, font);
+            graphics.DrawString(label, font, brush, (32 - size.Width) / 2F, (32 - size.Height) / 2F);
+        }
+        else
+        {
         using var pen = new Pen(Color.FromArgb(226, 232, 240), 2.2F);
         graphics.DrawLine(pen, 9, 12, 21, 12);
         graphics.DrawLine(pen, 21, 12, 17, 8);
@@ -5528,6 +5858,7 @@ internal static class TrayIconFactory
         graphics.DrawLine(pen, 23, 20, 11, 20);
         graphics.DrawLine(pen, 11, 20, 15, 16);
         graphics.DrawLine(pen, 11, 20, 15, 24);
+        }
         var handle = bitmap.GetHicon();
         try
         {
@@ -6679,7 +7010,11 @@ internal static class NativeMethods
     {
         var before = DescribeKeyboardLayout(GetForegroundKeyboardLayout());
         var layoutId = layout == KeyboardLayout.Russian ? RussianLayoutId : EnglishLayoutId;
-        var hkl = LoadKeyboardLayout(layoutId, KlfActivate);
+        var hkl = FindInstalledLayout(layout);
+        if (hkl == IntPtr.Zero)
+        {
+            hkl = LoadKeyboardLayout(layoutId, KlfActivate);
+        }
         if (hkl == IntPtr.Zero)
         {
             return new LayoutSwitchResult(layout, before, before, false, 0);
@@ -6706,6 +7041,34 @@ internal static class NativeMethods
         }
 
         return new LayoutSwitchResult(layout, before, DescribeKeyboardLayout(GetForegroundKeyboardLayout()), false, attempts);
+    }
+
+    public static KeyboardLayout GetForegroundLayout()
+    {
+        return MatchesKeyboardLayout(GetForegroundKeyboardLayout(), KeyboardLayout.Russian)
+            ? KeyboardLayout.Russian
+            : KeyboardLayout.English;
+    }
+
+    public static bool IsForegroundLatinPreferredField()
+    {
+        try
+        {
+            var automation = new CUIAutomationClass();
+            var element = automation.GetFocusedElement();
+            if (element is null || element.CurrentIsPassword != 0)
+            {
+                return false;
+            }
+
+            var metadata = string.Join(" ", element.CurrentName, element.CurrentAutomationId, element.CurrentClassName).ToLowerInvariant();
+            return new[] { "address", "omnibox", "url", "email", "e-mail", "search", "адрес", "почт", "поиск" }
+                .Any(marker => metadata.Contains(marker, StringComparison.Ordinal));
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     public static string GetForegroundProcessName()
@@ -6888,6 +7251,25 @@ internal static class NativeMethods
         return GetKeyboardLayout(threadId);
     }
 
+    private static IntPtr FindInstalledLayout(KeyboardLayout layout)
+    {
+        var count = GetKeyboardLayoutList(0, null);
+        if (count <= 0)
+        {
+            return IntPtr.Zero;
+        }
+
+        var layouts = new IntPtr[count];
+        GetKeyboardLayoutList(layouts.Length, layouts);
+        var current = GetForegroundKeyboardLayout();
+        if (MatchesKeyboardLayout(current, layout))
+        {
+            return current;
+        }
+
+        return layouts.FirstOrDefault(candidate => MatchesKeyboardLayout(candidate, layout));
+    }
+
     private static bool MatchesKeyboardLayout(IntPtr hkl, KeyboardLayout layout)
     {
         var localeId = GetLocaleId(hkl);
@@ -6974,6 +7356,9 @@ internal static class NativeMethods
 
     [DllImport("user32.dll")]
     private static extern IntPtr GetKeyboardLayout(uint idThread);
+
+    [DllImport("user32.dll")]
+    private static extern int GetKeyboardLayoutList(int nBuff, [Out] IntPtr[]? lpList);
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern IntPtr LoadKeyboardLayout(string pwszKLID, uint Flags);
