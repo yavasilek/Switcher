@@ -1,0 +1,17 @@
+#Индекс_Intent_Tree_WorkItems<[
+Базис:
+  Generated compatibility manifest for WorkItem atoms split from work/backlog.bvc.
+Вектор:
+  Keep work/backlog.bvc intact for current runtime/UI readers until they can read intent/**/*.work.bvc directly.
+Цель:
+  Provide a deterministic inventory of canonical intent tree task files without changing current backlog compatibility.
+WorkItems:
+  - integrate-workgraph-codex: intent/system/runtime/work/integrate-workgraph-codex.work.bvc
+
+Метки:
+  atom.profile: trace
+  intent.index: work_items
+  intent.source: work/backlog.bvc
+  intent.compatibility_projection: work/backlog.bvc
+  trace.status: pending
+]>

@@ -1,0 +1,50 @@
+#Задача_integrate_workgraph_codex<[
+Базис:
+  Проект используется в Codex и нуждается в локальном backlog, который агент ведёт без ручного управления карточками со стороны пользователя.
+  Интеграция должна быть dev-only, не менять production runtime и одинаково работать в основном checkout и Codex worktree.
+Вектор:
+  Добавить проектный MCP, точные версии Work Graph, локальный UI и инструкции автоматического жизненного цикла задач.
+  Отключить автоматические Git snapshots и проверить doctor, MCP, зависимости и настоящий временный Git worktree.
+Цель:
+  Все изменения проекта Switcher сопровождаются через локальный Work Graph с прозрачными проверками и доказательствами выполнения.
+Проверки:
+  Work Graph doctor завершается без ошибок и предупреждений.
+  MCP предоставляет инструменты и читает backlog текущего checkout.
+  Настоящий временный Git worktree проходит MCP и doctor smoke.
+  Команда git diff --check не выявляет дефектов форматирования.
+Анализ:
+  Интеграция изолирована в dev-файлах и не меняет прикладной код проекта. Проверенный worktree-aware runner исключает чтение backlog из неправильного checkout.
+Решение:
+  Применить проверенный шаблон social, NetPulse и Vinil с отдельным портом 4199 и точными версиями зависимостей.
+
+Метки:
+  work.closed_at: 2026-08-03T23:51:54.419Z
+  work.write.run_id: mcp-claim-integrate-workgraph-codex-1785800980807
+  atom.profile: work_item
+  migration.strategy: rebuild
+  trace.status: pending
+  work.analysis.at: 2026-08-03T23:49:40.768Z
+  work.analysis.source: create_work_item
+  work.decision.at: 2026-08-03T23:49:40.768Z
+  work.decision.verdict: useful
+  work.department: agent-platform
+  work.id: integrate-workgraph-codex
+  work.next_action: Установить зависимости и проверить Local и Worktree контуры Work Graph.
+  work.owner_role: codex
+  work.pipeline_stage: decided
+  work.priority: high
+  work.risk: low
+  work.status: done
+  work.target_files: .codex/config.toml, .work-graph/, AGENTS.md, .gitignore, architecture/, intent/, package.json, package-lock.json, work/
+  work.title: Интегрировать Work Graph в проект Switcher для Codex
+  work.updated_by: workgraph-mcp
+  work.write.at: 2026-08-03T23:51:54.420Z
+  work.write.operation: complete
+
+Свидетельства:
+  - Начата установка проверенного Work Graph шаблона для проекта Switcher.
+  - Локальный doctor, MCP smoke, npm audit, настоящий временный Git worktree и git diff --check завершились успешно.
+  - npm run workgraph:doctor; MCP smoke; npm audit; worktree smoke; git diff --check exitCode=0
+  - {"type":"test","command":"npm run workgraph:doctor; MCP smoke; npm audit; worktree smoke; git diff --check","exitCode":0,"status":"succeeded","taskId":"integrate-workgraph-codex","cmd":"npm run workgraph:doctor; MCP smoke; npm audit; worktree smoke; git diff --check","summary":"npm run workgraph:doctor; MCP smoke; npm audit; worktree smoke; git diff --check exitCode=0"}
+  - Work Graph интегрирован в Switcher; Local и Worktree контуры проверены, автоматические Git snapshots отключены.
+]>

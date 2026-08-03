@@ -1,0 +1,8 @@
+{
+  "schema": "workgraph.project.config.v2",
+  "projectRoot": "C:\\Users\\yavasilek\\Documents\\Switcher",
+  "projectId": "switcher",
+  "label": "Switcher",
+  "uiPort": 4199,
+  "createdAt": "2026-08-03T23:46:52.452Z"
+}

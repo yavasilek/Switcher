@@ -1,0 +1,14 @@
+{
+  "name": "switcher-dev-tools",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "workgraph:ui": "node .work-graph/run-ui.mjs",
+    "workgraph:mcp": "node .work-graph/run-mcp.mjs",
+    "workgraph:doctor": "node .work-graph/run-doctor.mjs"
+  },
+  "devDependencies": {
+    "@work-graph/cli": "0.2.26",
+    "@work-graph/mcp": "0.2.21"
+  }
+}

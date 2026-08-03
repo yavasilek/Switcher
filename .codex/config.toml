@@ -1,0 +1,6 @@
+[mcp_servers.workgraph]
+command = "node"
+args = [".work-graph/run-mcp.mjs"]
+startup_timeout_sec = 20
+tool_timeout_sec = 120
+enabled = true
